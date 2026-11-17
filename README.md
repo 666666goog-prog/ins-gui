@@ -1,4 +1,4 @@
-# Ins批量下载 v1.0.5
+# Ins批量下载 v1.0.6
 
 给开源工具 **Instaloader 4.16** 套的图形界面：全中文、鼠标操作、批量按账号下载 Instagram 帖子 / Reels / 头像 / 快拍 / 精选。
 
@@ -32,8 +32,8 @@ python test_logic.py
 仓库带了 GitHub Actions 手动构建（`.github/workflows/build-windows.yml`）：
 
 1. 推到 GitHub 后，进仓库 **Actions** 页，选 **Build Windows**，点 **Run workflow**
-2. 构建完在该次运行底部下载产物 `InsDownloader_Windows_X64_v1.0.5`
-3. 里面是 `InsDownloader_Windows_X64_v1.0.5.zip`，解压后双击文件夹里的 `InsDownloader_v1.0.5.exe` 使用（onedir 模式，exe 和旁边的文件要在一起，不要单独把 exe 拷出来）
+2. 构建完在该次运行底部下载产物 `InsDownloader_Windows_X64_v1.0.6`
+3. 里面是 `InsDownloader_Windows_X64_v1.0.6.zip`，解压后双击文件夹里的 `InsDownloader_v1.0.6.exe` 使用（onedir 模式，exe 和旁边的文件要在一起，不要单独把 exe 拷出来）
 
 ## 已知限制（v1）
 
@@ -46,6 +46,7 @@ python test_logic.py
 ## 技术说明
 
 - 单文件 GUI：`app.py`（tkinter），依赖只有 `instaloader==4.16`
-- 登录校验限时 45 秒（`verify_login_timed`）：校验在子线程里等、关掉请求前等待、每 10 秒报进度、超时明说，不再静默卡死（v1.0.3 浏览器登录干等 10 分钟的教训）
+- 登录校验（`verify_login_timed`）：三道检查并行赛跑、每道单请求超时 15 秒/最多重试 2 次、全程上限 90 秒、每 10 秒报进度、超时明说（v1.0.4 串行校验在用户机器上 45 秒走不完的教训）
+- 网络修正（v1.0.6）：启动时把 Windows 系统代理读进环境变量让 requests 全程走代理（浏览器认系统代理、Python 不一定认，认不到就直连被墙地址干等）；全局强制 IPv4（Python 挨个试地址，IPv6 不通会等满超时，浏览器有快速切换）；Cookie 校验前有一次“网络自检”（量打开 ins 首页的耗时并打进日志），日志能直接区分网络路径问题还是登录问题；启动日志会打印读到的系统代理
 - 下载逐条手动迭代 `Profile.get_posts()` / `get_reels()`，方便计数、停止和分类；没有用 `download_profile`
 - Instaloader 4.16 没有 `download_highlight()` 方法，精选是遍历 `get_highlights()` 后逐条 `download_storyitem()` 下的；Reels 方法名是 `get_reels()`（不是 `get_reels_posts()`）

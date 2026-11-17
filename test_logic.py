@@ -171,6 +171,44 @@ def test_verify_login_timed():
     print("PASS verify_login_timed")
 
 
+def test_network_fixes():
+    # IPv4 过滤：有 v4 时只留 v4；只有 v6 时原样返回（不能过滤成空）
+    import socket as _socket
+
+    fake = [(_socket.AF_INET6, None), (_socket.AF_INET, None), (_socket.AF_INET, None)]
+    got = app._filter_ipv4(fake)
+    assert len(got) == 2 and all(r[0] == _socket.AF_INET for r in got), got
+    only6 = [(_socket.AF_INET6, None)]
+    assert app._filter_ipv4(only6) == only6
+
+    # 系统代理应用：读到代理就写进环境变量（已有的不覆盖）
+    import os as _os
+    import urllib.request as _ur
+
+    saved = {k: _os.environ.get(k) for k in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")}
+    orig_gp = _ur.getproxies
+    try:
+        for k in saved:
+            _os.environ.pop(k, None)
+        _ur.getproxies = lambda: {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+        note = app._apply_system_proxy()
+        assert "127.0.0.1:7890" in note, note
+        assert _os.environ.get("HTTPS_PROXY") == "http://127.0.0.1:7890"
+        # 已有环境变量时不覆盖
+        _os.environ["HTTPS_PROXY"] = "http://example:1"
+        _ur.getproxies = lambda: {"https": "http://127.0.0.1:9999"}
+        app._apply_system_proxy()
+        assert _os.environ["HTTPS_PROXY"] == "http://example:1"
+    finally:
+        _ur.getproxies = orig_gp
+        for k, v in saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+    print("PASS network fixes")
+
+
 if __name__ == "__main__":
     test_extract_username()
     test_parse_targets()
@@ -180,4 +218,5 @@ if __name__ == "__main__":
     test_settings_roundtrip()
     test_paths_are_portable()
     test_verify_login_timed()
+    test_network_fixes()
     print("全部通过")

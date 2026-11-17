@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Ins批量下载 v1.0.5
+Ins批量下载 v1.0.6
 基于开源 Instaloader 4.16 的图形界面，全中文、鼠标操作为主。
 
 便携规则：所有数据都放在程序旁边的文件夹里，绝不写 AppData。
@@ -13,10 +13,12 @@ import json
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +30,58 @@ for _proxy_var in ("NO_PROXY", "no_proxy"):
         if _host not in _parts:
             _parts.append(_host)
     os.environ[_proxy_var] = ",".join(_parts)
+
+
+# ---------------------------------------------------------------------------
+# 网络修正（v1.0.6）：让程序的请求和浏览器一样顺畅到达 Instagram
+# ---------------------------------------------------------------------------
+
+def _filter_ipv4(results):
+    """getaddrinfo 的结果只留 IPv4（只要有 IPv4 可用）。
+
+    Python 连地址是挨个试的：IPv6 路由不通时，它会等满超时才换下一个；
+    浏览器有快速切换所以不卡。这是“浏览器快、程序慢”的常见根源。
+    """
+    v4 = [r for r in results if r[0] == socket.AF_INET]
+    return v4 if v4 else results
+
+
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+    return _filter_ipv4(_orig_getaddrinfo(host, port, family, type, proto, flags))
+
+
+socket.getaddrinfo = _getaddrinfo_ipv4
+
+
+def _apply_system_proxy():
+    """把 Windows 系统代理读出来写进环境变量，让 requests 全程走代理。
+
+    浏览器会自动用系统代理；Python 的 requests 不一定认（尤其是
+    “自动配置脚本”那种设置），认不到就会去直连被墙的地址、干等超时。
+    写进环境变量后，程序里新建的每个会话都会在发请求时自动带上。
+    返回一句给日志看的说明；代理地址是本机地址（如 127.0.0.1:7890），
+    不是账号信息，可以打进日志。
+    """
+    try:
+        proxies = urllib.request.getproxies() or {}
+    except Exception:
+        return ""
+    applied = []
+    for scheme in ("http", "https"):
+        url = proxies.get(scheme)
+        if not url:
+            continue
+        for var in (f"{scheme.upper()}_PROXY", f"{scheme}_proxy"):
+            if not os.environ.get(var):
+                os.environ[var] = url
+        applied.append(f"{scheme}={url}")
+    return "，".join(applied)
+
+
+SYSTEM_PROXY_NOTE = _apply_system_proxy()
 
 # ---------------------------------------------------------------------------
 # 路径（便携：永远在 exe / 脚本旁边）
@@ -46,8 +100,8 @@ SESSIONS_DIR = DATA_DIR / "sessions"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_DOWNLOAD_DIR = BASE_DIR / "下载"
 
-APP_TITLE = "Ins批量下载 v1.0.5"
-VERSION = "1.0.5"
+APP_TITLE = "Ins批量下载 v1.0.6"
+VERSION = "1.0.6"
 
 # ---------------------------------------------------------------------------
 # 纯逻辑（不打开窗口、不联网，test_logic.py 会测这部分）
@@ -189,7 +243,7 @@ def _verify_checks(cookies):
     300 秒请求超时叠加一道道串行重试——一个请求卡住就能吃掉全部时间。
     """
     def _mk(fn):
-        sub = make_loader("快速")
+        sub = make_loader("快速", request_timeout=15)
         try:
             sub.context.sleep = False
             sub.context.request_timeout = 15
@@ -289,6 +343,25 @@ def verify_login_timed(loader, cookies, log, timeout=90):
     return ("timeout", None)
 
 
+def _net_self_check(log):
+    """校验前先量一下到 Instagram 的连通性，把结果打进日志。
+
+    这样日志能直接区分：是根本连不通/慢（网络路径问题），
+    还是连得通但 ins 不认这个登录（登录本身的问题）。
+    """
+    import requests
+
+    t0 = time.monotonic()
+    try:
+        resp = requests.get("https://www.instagram.com/", timeout=10)
+        log(f"网络自检：打开 Instagram 首页用了 {time.monotonic() - t0:.1f} 秒"
+            f"（状态 {resp.status_code}），网络这条路是通的")
+    except Exception as exc:
+        log(f"网络自检：打开 Instagram 首页失败（{type(exc).__name__}），"
+            f"耗了 {time.monotonic() - t0:.1f} 秒——连首页都到不了，校验更到不了，"
+            "问题在网络路径（代理没被程序用上之类），不在登录本身")
+
+
 DEFAULT_SETTINGS = {
     "login_username": "",
     "download_dir": "",
@@ -371,7 +444,8 @@ def explain_error(exc):
 # 下载引擎构造
 # ---------------------------------------------------------------------------
 
-def make_loader(speed="正常", only_video=False, only_image=False, download_dir=None):
+def make_loader(speed="正常", only_video=False, only_image=False, download_dir=None,
+                request_timeout=60):
     """按“只要媒体文件、不要附加文件”的快设置构造 Instaloader。
 
     - 不下评论、不下定位、不存 json 元数据、不生成说明 txt —— 少发很多请求，快很多
@@ -398,7 +472,7 @@ def make_loader(speed="正常", only_video=False, only_image=False, download_dir
         post_metadata_txt_pattern=None,
         storyitem_metadata_txt_pattern=None,
         max_connection_attempts=3,
-        request_timeout=60,
+        request_timeout=request_timeout,
     )
 
 
@@ -578,6 +652,9 @@ class App:
         self.root.after(100, self._poll_queue)
 
         self.log("程序已打开。数据文件夹：" + str(DATA_DIR))
+        self.log("网络设置：" + (f"已按系统代理走（{SYSTEM_PROXY_NOTE}）"
+                                  if SYSTEM_PROXY_NOTE else "没读到系统代理（直连或隧道模式）")
+                 + "；已强制 IPv4")
         self._startup_session_check()
 
     # ---------------- 通用小工具 ----------------
@@ -770,6 +847,7 @@ class App:
         if not sessionid_looks_complete(cookies):
             self.log("提醒：sessionid 看起来不完整——正常的是一长串、中间有好几段。"
                      "如果这次验不过，多半是复制时只复制到一截，请回到浏览器把整行 Cookie 完整复制。")
+        _net_self_check(self.log)
         loader = make_loader(self.speed_var.get())
         try:
             status, who = verify_login_timed(loader, cookies, self.log, timeout=90)
