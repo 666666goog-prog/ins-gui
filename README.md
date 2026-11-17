@@ -1,10 +1,10 @@
-# Ins批量下载 v1.0.4
+# Ins批量下载 v1.0.5
 
 给开源工具 **Instaloader 4.16** 套的图形界面：全中文、鼠标操作、批量按账号下载 Instagram 帖子 / Reels / 头像 / 快拍 / 精选。
 
 ## 功能
 
-- **登录**（登录后能下私密账号、快拍、精选，也更不容易被限流）—— 只保留两种（v1.0.4 精简，浏览器窗口/读取浏览器登录已删）
+- **登录**（登录后能下私密账号、快拍、精选，也更不容易被限流）—— 只保留两种（精简版，浏览器窗口/读取浏览器登录已删）
   - **Cookie 登录（推荐）**：在浏览器里登录好 Instagram，复制整串 Cookie 粘贴进来，点「Cookie登录并保存」；必须包含 `sessionid` 且要整行完整。校验走三道（test_login → 按 ds_user_id 查资料 → 手机接口），2026-11-17 已用真实 Cookie 在服务端实测验过、能查到用户名
   - 账号密码登录：填用户名+密码点「账号密码登录并保存」，密码不保存，只保存登录状态到程序旁边的 `data/sessions/`，下次打开自动恢复；开了两步验证的账号会弹窗让你输验证码
   - 不登录也能用，只能下公开账号
@@ -32,8 +32,8 @@ python test_logic.py
 仓库带了 GitHub Actions 手动构建（`.github/workflows/build-windows.yml`）：
 
 1. 推到 GitHub 后，进仓库 **Actions** 页，选 **Build Windows**，点 **Run workflow**
-2. 构建完在该次运行底部下载产物 `InsDownloader_Windows_X64_v1.0.4`
-3. 里面是 `InsDownloader_Windows_X64_v1.0.4.zip`，解压后双击文件夹里的 `InsDownloader_v1.0.4.exe` 使用（onedir 模式，exe 和旁边的文件要在一起，不要单独把 exe 拷出来）
+2. 构建完在该次运行底部下载产物 `InsDownloader_Windows_X64_v1.0.5`
+3. 里面是 `InsDownloader_Windows_X64_v1.0.5.zip`，解压后双击文件夹里的 `InsDownloader_v1.0.5.exe` 使用（onedir 模式，exe 和旁边的文件要在一起，不要单独把 exe 拷出来）
 
 ## 已知限制（v1）
 

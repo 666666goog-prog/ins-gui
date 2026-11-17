@@ -124,29 +124,41 @@ def test_paths_are_portable():
 
 
 def test_verify_login_timed():
-    # 限时校验：快回 ok、慢回必须 timeout 且中途有进度日志，绝不静默卡死
+    # 赛跑版校验：谁先查到用谁；全空为 bad；全慢必须 timeout 且有进度日志
     import time as _time
 
     class _Ctx:
         sleep = True
 
+        def update_cookies(self, cookies):
+            pass
+
     class _Loader:
         def __init__(self):
             self.context = _Ctx()
 
-    orig = app.verify_login
+    orig = app._verify_checks
     try:
-        app.verify_login = lambda loader, cookies: "someuser"
-        assert app.verify_login_timed(_Loader(), {}, lambda m: None, timeout=10) == ("ok", "someuser")
-
-        app.verify_login = lambda loader, cookies: None
-        assert app.verify_login_timed(_Loader(), {}, lambda m: None, timeout=10) == ("bad", None)
-
-        def _slow(loader, cookies):
+        def _slow30():
             _time.sleep(30)
             return "late"
 
-        app.verify_login = _slow
+        # 快的先赢，不等慢的
+        app._verify_checks = lambda cookies: [("慢的", _slow30), ("快的", lambda: "someuser")]
+        logs = []
+        t0 = _time.monotonic()
+        result = app.verify_login_timed(_Loader(), {}, logs.append, timeout=30)
+        elapsed = _time.monotonic() - t0
+        assert result == ("ok", "someuser"), result
+        assert elapsed < 10, elapsed
+        assert any("确认通过" in m for m in logs), logs
+
+        # 全部查不到 -> bad
+        app._verify_checks = lambda cookies: [("甲", lambda: None), ("乙", lambda: None)]
+        assert app.verify_login_timed(_Loader(), {}, lambda m: None, timeout=10) == ("bad", None)
+
+        # 全部慢 -> timeout，且中途有进度日志
+        app._verify_checks = lambda cookies: [("慢甲", _slow30), ("慢乙", _slow30)]
         logs = []
         t0 = _time.monotonic()
         result = app.verify_login_timed(_Loader(), {}, logs.append, timeout=12)
@@ -155,7 +167,7 @@ def test_verify_login_timed():
         assert elapsed < 20, elapsed
         assert any("正在向 Instagram 确认" in m for m in logs), logs
     finally:
-        app.verify_login = orig
+        app._verify_checks = orig
     print("PASS verify_login_timed")
 
 

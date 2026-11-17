@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Ins批量下载 v1.0.4
+Ins批量下载 v1.0.5
 基于开源 Instaloader 4.16 的图形界面，全中文、鼠标操作为主。
 
 便携规则：所有数据都放在程序旁边的文件夹里，绝不写 AppData。
@@ -46,8 +46,8 @@ SESSIONS_DIR = DATA_DIR / "sessions"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_DOWNLOAD_DIR = BASE_DIR / "下载"
 
-APP_TITLE = "Ins批量下载 v1.0.4"
-VERSION = "1.0.4"
+APP_TITLE = "Ins批量下载 v1.0.5"
+VERSION = "1.0.5"
 
 # ---------------------------------------------------------------------------
 # 纯逻辑（不打开窗口、不联网，test_logic.py 会测这部分）
@@ -180,40 +180,112 @@ def verify_login(loader, cookies):
     return None
 
 
-def verify_login_timed(loader, cookies, log, timeout=45):
-    """限时版 verify_login：返回 (状态, 用户名)，状态为 ok / bad / timeout。
+def _verify_checks(cookies):
+    """三道校验各做成一个无参函数，返回 [(名字, 函数)]，函数返回用户名或 None。
 
-    v1.0.3 的教训：校验在单独一步里同步跑，Instaloader 撞上限流时能在
-    一次校验里睡好几分钟且不吐一个字，界面看起来就像死了。
-    这里把校验放到子线程里等：关掉校验期间的请求前等待，每 10 秒报一次
-    还在等，超过 timeout 就明确报“校验超时”，绝不静默卡住。
+    每道用独立的 loader（不共用会话，免得并行时互相干扰），并且都改成
+    快速失败：单次请求最多等 15 秒（原版默认 300 秒）、最多重试 2 次、
+    不做请求前等待。v1.0.4 在用户机器上 45 秒超时的根源就是原版的
+    300 秒请求超时叠加一道道串行重试——一个请求卡住就能吃掉全部时间。
+    """
+    def _mk(fn):
+        sub = make_loader("快速")
+        try:
+            sub.context.sleep = False
+            sub.context.request_timeout = 15
+            sub.context.max_connection_attempts = 2
+        except Exception:
+            pass
+        sub.context.update_cookies(cookies)
+        return lambda: fn(sub)
+
+    def _by_test_login(sub):
+        try:
+            return sub.test_login()
+        except Exception:
+            return None
+
+    def _by_profile(sub):
+        uid = derive_user_id(cookies)
+        if not uid:
+            return None
+        try:
+            from instaloader.structures import Profile
+
+            prof = Profile.from_id(sub.context, int(uid))
+            return prof.username if prof is not None else None
+        except Exception:
+            return None
+
+    def _by_iphone(sub):
+        uid = derive_user_id(cookies)
+        if not uid:
+            return None
+        try:
+            data = sub.context.get_iphone_json(f"api/v1/users/{uid}/info/", {})
+            return ((data or {}).get("user") or {}).get("username")
+        except Exception:
+            return None
+
+    return [("官方检查", _mk(_by_test_login)),
+            ("按账号ID查资料", _mk(_by_profile)),
+            ("手机接口", _mk(_by_iphone))]
+
+
+def verify_login_timed(loader, cookies, log, timeout=90):
+    """限时校验：三道检查同时赛跑，哪道先查到用户名就用哪道。
+
+    返回 (状态, 用户名)，状态为 ok / bad / timeout。
+    v1.0.3 的教训：校验同步串行跑，撞上限流能在一步里睡好几分钟还不吐字。
+    v1.0.4 的教训：串行 + 原版 300 秒请求超时，用户网络慢时 45 秒根本不够
+    三道走完。所以 v1.0.5 改成并行赛跑 + 每道快速失败，全程每 10 秒报
+    一次进度，超过上限明确报超时，绝不静默卡住。
     """
     try:
         loader.context.sleep = False
+        loader.context.request_timeout = 15
+        loader.context.max_connection_attempts = 2
     except Exception:
         pass
-    box = {}
+    loader.context.update_cookies(cookies)
+    checks = _verify_checks(cookies)
+    results = {}
+    lock = threading.Lock()
 
-    def _run():
+    def _run(name, fn):
         try:
-            box["who"] = verify_login(loader, cookies)
+            who = fn()
         except Exception:
-            box["who"] = None
-        box["done"] = True
+            who = None
+        with lock:
+            results[name] = who
 
-    threading.Thread(target=_run, daemon=True).start()
+    for name, fn in checks:
+        threading.Thread(target=_run, args=(name, fn), daemon=True).start()
     waited = 0
     while waited < timeout:
-        if box.get("done"):
-            who = box.get("who")
-            return ("ok", who) if who else ("bad", None)
+        with lock:
+            done = len(results)
+            winners = [(n, w) for n, w in results.items() if w]
+        if winners:
+            name, who = winners[0]
+            log(f"确认通过（走的是“{name}”这道）")
+            return ("ok", who)
+        if done >= len(checks):
+            return ("bad", None)
         time.sleep(2)
         waited += 2
-        if waited % 10 == 0 and not box.get("done"):
-            log(f"正在向 Instagram 确认这个登录…已等 {waited} 秒（最多等 {timeout} 秒）")
-    if box.get("done"):
-        who = box.get("who")
-        return ("ok", who) if who else ("bad", None)
+        if waited % 10 == 0:
+            with lock:
+                done = len(results)
+            if done < len(checks):
+                log(f"正在向 Instagram 确认这个登录…已等 {waited} 秒（最多等 {timeout} 秒）")
+    with lock:
+        winners = [(n, w) for n, w in results.items() if w]
+    if winners:
+        name, who = winners[0]
+        log(f"确认通过（走的是“{name}”这道）")
+        return ("ok", who)
     return ("timeout", None)
 
 
@@ -326,6 +398,7 @@ def make_loader(speed="正常", only_video=False, only_image=False, download_dir
         post_metadata_txt_pattern=None,
         storyitem_metadata_txt_pattern=None,
         max_connection_attempts=3,
+        request_timeout=60,
     )
 
 
@@ -699,10 +772,10 @@ class App:
                      "如果这次验不过，多半是复制时只复制到一截，请回到浏览器把整行 Cookie 完整复制。")
         loader = make_loader(self.speed_var.get())
         try:
-            status, who = verify_login_timed(loader, cookies, self.log, timeout=45)
+            status, who = verify_login_timed(loader, cookies, self.log, timeout=90)
             if status == "timeout":
                 self.msg_queue.put(("status", "登录状态：未登录"))
-                self.log("向 Instagram 确认时 45 秒没等到回应（多半是被限流或网络卡住），"
+                self.log("向 Instagram 确认时 90 秒没等到回应（多半是被限流或网络卡住），"
                          "不是当场判死刑。过几分钟再点一次就行。")
                 return
             if not who:
