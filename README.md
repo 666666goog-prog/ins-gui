@@ -1,4 +1,4 @@
-# Ins批量下载 v1.0.1
+# Ins批量下载 v1.0.2
 
 给开源工具 **Instaloader 4.16** 套的图形界面：全中文、鼠标操作、批量按账号下载 Instagram 帖子 / Reels / 头像 / 快拍 / 精选。
 
@@ -32,8 +32,8 @@ python test_logic.py
 仓库带了 GitHub Actions 手动构建（`.github/workflows/build-windows.yml`）：
 
 1. 推到 GitHub 后，进仓库 **Actions** 页，选 **Build Windows**，点 **Run workflow**
-2. 构建完在该次运行底部下载产物 `InsDownloader_Windows_X64_v1.0.1`
-3. 里面是 `InsDownloader_Windows_X64_v1.0.1.zip`，解压后双击文件夹里的 `InsDownloader_v1.0.1.exe` 使用（onedir 模式，exe 和旁边的文件要在一起，不要单独把 exe 拷出来）
+2. 构建完在该次运行底部下载产物 `InsDownloader_Windows_X64_v1.0.2`
+3. 里面是 `InsDownloader_Windows_X64_v1.0.2.zip`，解压后双击文件夹里的 `InsDownloader_v1.0.2.exe` 使用（onedir 模式，exe 和旁边的文件要在一起，不要单独把 exe 拷出来）
 
 ## 已知限制（v1）
 

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Ins批量下载 v1.0.1
+Ins批量下载 v1.0.2
 基于开源 Instaloader 4.16 的图形界面，全中文、鼠标操作为主。
 
 便携规则：所有数据都放在程序旁边的文件夹里，绝不写 AppData。
@@ -15,6 +15,7 @@ import queue
 import re
 import sys
 import threading
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -35,8 +36,8 @@ SESSIONS_DIR = DATA_DIR / "sessions"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_DOWNLOAD_DIR = BASE_DIR / "下载"
 
-APP_TITLE = "Ins批量下载 v1.0.1"
-VERSION = "1.0.1"
+APP_TITLE = "Ins批量下载 v1.0.2"
+VERSION = "1.0.2"
 
 # ---------------------------------------------------------------------------
 # 纯逻辑（不打开窗口、不联网，test_logic.py 会测这部分）
@@ -115,6 +116,49 @@ def parse_cookie_string(text):
         if name:
             cookies[name] = value
     return cookies
+
+
+def derive_user_id(cookies):
+    """从 Cookie 里推出自己的数字 ID：先看 ds_user_id，没有就从 sessionid 第一段拆。"""
+    uid = str((cookies or {}).get("ds_user_id") or "").strip()
+    if uid.isdigit():
+        return uid
+    sid = urllib.parse.unquote(str((cookies or {}).get("sessionid") or ""))
+    first = sid.split(":")[0].strip() if sid else ""
+    return first if first.isdigit() else ""
+
+
+def sessionid_looks_complete(cookies):
+    """sessionid 正常是一长串、解码后至少有两段冒号分隔；只剩一截就是没复制全。"""
+    sid = urllib.parse.unquote(str((cookies or {}).get("sessionid") or ""))
+    return sid.count(":") >= 2 and len(sid) >= 30
+
+
+def verify_login(loader, cookies):
+    """校验 Cookie 登录，返回用户名或 None。
+
+    先用库自带的 test_login；它偶尔会误判（返回空但登录其实有效），
+    再用 ds_user_id 查本人资料兜底，查到用户名就算登录成立。
+    """
+    loader.context.update_cookies(cookies)
+    who = None
+    try:
+        who = loader.test_login()
+    except Exception:
+        who = None
+    if who:
+        return who
+    uid = derive_user_id(cookies)
+    if uid:
+        try:
+            from instaloader.structures import Profile
+
+            prof = Profile.from_id(loader.context, int(uid))
+            if prof is not None and prof.username:
+                return prof.username
+        except Exception:
+            pass
+    return None
 
 
 DEFAULT_SETTINGS = {
@@ -318,9 +362,10 @@ class App:
 
         row2 = tk.Frame(login_frame)
         row2.pack(fill="x", pady=(6, 0))
-        tk.Button(row2, text="登录并保存", width=14, command=self.on_password_login).pack(side="left")
-        tk.Button(row2, text="读取Edge登录", width=14, command=self.on_edge_login).pack(side="left", padx=(8, 0))
-        tk.Button(row2, text="退出登录", width=10, command=self.on_logout).pack(side="left", padx=(8, 0))
+        tk.Button(row2, text="登录并保存", width=12, command=self.on_password_login).pack(side="left")
+        tk.Button(row2, text="读取Edge登录", width=12, command=self.on_edge_login).pack(side="left", padx=(6, 0))
+        tk.Button(row2, text="读取Chrome登录", width=13, command=self.on_chrome_login).pack(side="left", padx=(6, 0))
+        tk.Button(row2, text="退出登录", width=9, command=self.on_logout).pack(side="left", padx=(6, 0))
         tk.Label(row2, textvariable=self.login_status_var).pack(side="left", padx=(12, 0))
 
         crow = tk.Frame(login_frame)
@@ -334,7 +379,8 @@ class App:
         tk.Button(cbtn, text="Cookie登录并保存", command=self.on_cookie_login).pack()
 
         tk.Label(login_frame, anchor="w", fg="#666666",
-                 text="Edge登录：先在 Edge 里登录好 Instagram，再把 Edge 完全关掉，然后点“读取Edge登录”。\n"
+                 text="浏览器登录：先在 Edge 或 Chrome 里登录好 Instagram，再把浏览器完全关掉，然后点对应的“读取…登录”"
+                      "（Chrome 新版加密严，可能读不到，读不到就用 Cookie 粘贴）。\n"
                       "Cookie登录：在浏览器里登录好 Instagram，复制整串 Cookie 粘贴到上面，点“Cookie登录并保存”（必须包含 sessionid）。\n"
                       f"数据都存在程序旁边：{DATA_DIR}（登录保存）和下载文件夹里，不放 AppData。").pack(fill="x", pady=(4, 0))
 
@@ -501,6 +547,18 @@ class App:
                 self.msg_queue.put(("status", "登录状态：未登录"))
                 return
             who = loader.test_login()
+            if not who:
+                # test_login 偶尔误判，用保存的 ds_user_id 查本人资料兜底
+                try:
+                    uid = loader.context.user_id
+                    if uid:
+                        from instaloader.structures import Profile
+
+                        prof = Profile.from_id(loader.context, int(uid))
+                        if prof is not None and prof.username:
+                            who = prof.username
+                except Exception:
+                    who = None
             if who:
                 self.logged_in_user = who
                 self.msg_queue.put(("status", f"登录状态：已登录 {who}"))
@@ -555,36 +613,41 @@ class App:
     def on_edge_login(self):
         self.log("读取Edge登录前确认一下：先在 Edge 里登录好 Instagram，再把 Edge 完全关掉（窗口全关），不然读不到。开始读取…")
         self.login_status_var.set("登录状态：正在读取Edge登录…")
-        threading.Thread(target=self._edge_login_worker, daemon=True).start()
+        threading.Thread(target=self._browser_login_worker, args=("edge", "Edge"), daemon=True).start()
 
-    def _edge_login_worker(self):
+    def on_chrome_login(self):
+        self.log("读取Chrome登录前确认一下：先在 Chrome 里登录好 Instagram，再把 Chrome 完全关掉（窗口全关），不然读不到。开始读取…")
+        self.login_status_var.set("登录状态：正在读取Chrome登录…")
+        threading.Thread(target=self._browser_login_worker, args=("chrome", "Chrome"), daemon=True).start()
+
+    def _browser_login_worker(self, kind, label):
         try:
             import browser_cookie3
         except Exception:
             self.msg_queue.put(("status", "登录状态：未登录"))
-            self.log("缺少 browser_cookie3 组件，读不了 Edge 登录（打包版里是带好的，出现这个说明打包不完整）。")
+            self.log(f"缺少 browser_cookie3 组件，读不了 {label} 登录（打包版里是带好的，出现这个说明打包不完整）。")
             return
         try:
             cookies = {}
-            jar = browser_cookie3.edge(domain_name="instagram.com")
+            jar = getattr(browser_cookie3, kind)(domain_name="instagram.com")
             for cookie in jar:
                 if "instagram.com" in (cookie.domain or ""):
                     cookies[cookie.name] = cookie.value
         except Exception as exc:
             self.msg_queue.put(("status", "登录状态：未登录"))
-            self.log(f"读取 Edge 登录失败（多半是 Edge 没完全关掉，或者 Edge 里还没登录 Instagram）：{exc}")
+            extra = "Chrome 新版加密比较严，读不到是常见情况，这种时候用上面 Cookie 粘贴那条路。" if kind == "chrome" else ""
+            self.log(f"读取 {label} 登录失败（多半是 {label} 没完全关掉，或者 {label} 里还没登录 Instagram）：{exc}。{extra}")
             return
         if not cookies.get("sessionid"):
             self.msg_queue.put(("status", "登录状态：未登录"))
-            self.log("没读到 Instagram 的登录（没有 sessionid）。请在 Edge 里先登录一次 Instagram，再关掉 Edge 重试。")
+            self.log(f"没读到 Instagram 的登录（没有 sessionid）。请在 {label} 里先登录一次 Instagram，再关掉 {label} 重试。")
             return
         loader = make_loader(self.speed_var.get())
         try:
-            loader.context.update_cookies(cookies)
-            who = loader.test_login()
+            who = verify_login(loader, cookies)
             if not who:
                 self.msg_queue.put(("status", "登录状态：未登录"))
-                self.log("Edge 里的登录已经失效了（Instagram 不认）。请在 Edge 里重新登录一次再来读。")
+                self.log(f"{label} 里的登录已经失效了（Instagram 不认）。请在 {label} 里重新登录一次再来读。")
                 return
             SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
             loader.save_session_to_file(filename=str(session_path(who)))
@@ -592,10 +655,10 @@ class App:
             self.settings["login_username"] = who
             save_settings(self.settings)
             self.msg_queue.put(("status", f"登录状态：已登录 {who}"))
-            self.log(f"Edge 登录读取成功，已保存，下次打开不用再读：{who}")
+            self.log(f"{label} 登录读取成功，已保存，下次打开不用再读：{who}")
         except Exception as exc:
             self.msg_queue.put(("status", "登录状态：未登录"))
-            self.log("Edge 登录确认失败：" + explain_error(exc))
+            self.log(f"{label} 登录确认失败：" + explain_error(exc))
 
     def on_paste_cookie(self):
         try:
@@ -622,13 +685,21 @@ class App:
         threading.Thread(target=self._cookie_login_worker, args=(cookies,), daemon=True).start()
 
     def _cookie_login_worker(self, cookies):
+        found = "、".join(
+            f"{name} {'有' if cookies.get(name) else '没有'}"
+            for name in ("sessionid", "csrftoken", "ds_user_id"))
+        self.log(f"解析到 {len(cookies)} 项 Cookie，其中 {found}。（只报有无，不显示内容）")
+        if not sessionid_looks_complete(cookies):
+            self.log("提醒：sessionid 看起来不完整——正常的是一长串、中间有好几段。"
+                     "如果这次验不过，多半是复制时只复制到一截，请回到浏览器把整行 Cookie 完整复制。")
         loader = make_loader(self.speed_var.get())
         try:
-            loader.context.update_cookies(cookies)
-            who = loader.test_login()
+            who = verify_login(loader, cookies)
             if not who:
                 self.msg_queue.put(("status", "登录状态：未登录"))
-                self.log("这个 Cookie 已经失效了（Instagram 不认）。请在浏览器里重新登录一次，再复制新的 Cookie。")
+                self.log("这个 Cookie 没通过：Instagram 没认这个登录。"
+                         "先确认浏览器里打开 instagram.com 还是登录着的状态；"
+                         "复制时要选发往 www.instagram.com 的那条请求、整行 Cookie 都要，不要只截一截。")
                 return
             SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
             loader.save_session_to_file(filename=str(session_path(who)))

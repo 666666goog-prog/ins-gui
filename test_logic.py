@@ -66,6 +66,22 @@ def test_parse_cookie_string():
     print("PASS parse_cookie_string")
 
 
+def test_derive_user_id_and_sessionid_shape():
+    # ds_user_id 优先
+    assert app.derive_user_id({"ds_user_id": "42", "sessionid": "x"}) == "42"
+    # 没有 ds_user_id 时从 sessionid 第一段拆（URL 编码形态）
+    assert app.derive_user_id({"sessionid": "59977553097%3Aabcdef%3A28%3Axx"}) == "59977553097"
+    # 都没有/乱写返回空
+    assert app.derive_user_id({}) == ""
+    assert app.derive_user_id({"sessionid": "notanumber"}) == ""
+    # sessionid 完整性：多段长串算完整，只剩一截不算
+    assert app.sessionid_looks_complete({"sessionid": "59977553097%3Aabcdef0123456789%3A28%3Axx"}) is True
+    assert app.sessionid_looks_complete({"sessionid": "59977553097%3A"}) is False
+    assert app.sessionid_looks_complete({"sessionid": "59977553097"}) is False
+    assert app.sessionid_looks_complete({}) is False
+    print("PASS derive_user_id / sessionid shape")
+
+
 def test_settings_roundtrip():
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "data" / "settings.json"
@@ -101,6 +117,7 @@ if __name__ == "__main__":
     test_extract_username()
     test_parse_targets()
     test_parse_cookie_string()
+    test_derive_user_id_and_sessionid_shape()
     test_settings_roundtrip()
     test_paths_are_portable()
     print("全部通过")
