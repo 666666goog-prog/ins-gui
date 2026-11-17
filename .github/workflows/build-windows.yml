@@ -25,18 +25,19 @@ jobs:
       - name: Build exe (onedir)
         run: >
           pyinstaller --noconfirm --onedir --windowed
-          --name InsDownloader_v1.0.2
+          --name InsDownloader_v1.0.3
           --collect-all instaloader
           --collect-all browser_cookie3
+          --collect-all websocket
           app.py
 
       - name: Package zip
         shell: pwsh
         run: |
-          Compress-Archive -Path "dist/InsDownloader_v1.0.2" -DestinationPath "InsDownloader_Windows_X64_v1.0.2.zip"
+          Compress-Archive -Path "dist/InsDownloader_v1.0.3" -DestinationPath "InsDownloader_Windows_X64_v1.0.3.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: InsDownloader_Windows_X64_v1.0.2
-          path: InsDownloader_Windows_X64_v1.0.2.zip
+          name: InsDownloader_Windows_X64_v1.0.3
+          path: InsDownloader_Windows_X64_v1.0.3.zip

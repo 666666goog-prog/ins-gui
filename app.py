@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Ins批量下载 v1.0.2
+Ins批量下载 v1.0.3
 基于开源 Instaloader 4.16 的图形界面，全中文、鼠标操作为主。
 
 便携规则：所有数据都放在程序旁边的文件夹里，绝不写 AppData。
@@ -13,11 +13,23 @@ import json
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
+import time
 import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
+
+# 本机回环地址绝不能走代理：软件要连本机专用浏览器的调试口（localhost），
+# 用户的代理软件会把这类请求也拦走，所以启动时（任何联网之前）先把回环加进 NO_PROXY。
+for _proxy_var in ("NO_PROXY", "no_proxy"):
+    _parts = [p.strip() for p in os.environ.get(_proxy_var, "").split(",") if p.strip()]
+    for _host in ("localhost", "127.0.0.1"):
+        if _host not in _parts:
+            _parts.append(_host)
+    os.environ[_proxy_var] = ",".join(_parts)
 
 # ---------------------------------------------------------------------------
 # 路径（便携：永远在 exe / 脚本旁边）
@@ -36,8 +48,8 @@ SESSIONS_DIR = DATA_DIR / "sessions"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_DOWNLOAD_DIR = BASE_DIR / "下载"
 
-APP_TITLE = "Ins批量下载 v1.0.2"
-VERSION = "1.0.2"
+APP_TITLE = "Ins批量下载 v1.0.3"
+VERSION = "1.0.3"
 
 # ---------------------------------------------------------------------------
 # 纯逻辑（不打开窗口、不联网，test_logic.py 会测这部分）
@@ -138,7 +150,8 @@ def verify_login(loader, cookies):
     """校验 Cookie 登录，返回用户名或 None。
 
     先用库自带的 test_login；它偶尔会误判（返回空但登录其实有效），
-    再用 ds_user_id 查本人资料兜底，查到用户名就算登录成立。
+    再用 ds_user_id 查本人资料兜底（网页接口、手机接口各一道），
+    查到用户名就算登录成立。
     """
     loader.context.update_cookies(cookies)
     who = None
@@ -158,7 +171,50 @@ def verify_login(loader, cookies):
                 return prof.username
         except Exception:
             pass
+        # 第三道兜底：走手机接口按 ID 查本人资料
+        try:
+            data = loader.context.get_iphone_json(f"api/v1/users/{uid}/info/", {})
+            username = ((data or {}).get("user") or {}).get("username")
+            if username:
+                return username
+        except Exception:
+            pass
     return None
+
+
+def find_browser():
+    """找用户电脑上的 Edge / Chrome，先 Edge 后 Chrome。
+
+    找到返回 (可执行文件路径, "Edge"/"Chrome")，都没找到返回 None。
+    """
+    candidates = [
+        (r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe", "Edge"),
+        (r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe", "Edge"),
+        (r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe", "Edge"),
+        (r"%ProgramFiles%\Google\Chrome\Application\chrome.exe", "Chrome"),
+        (r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe", "Chrome"),
+        (r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe", "Chrome"),
+    ]
+    for raw, label in candidates:
+        path = os.path.expandvars(raw)
+        # 环境变量没展开（路径里还带 %）说明这台机器没这个变量，跳过
+        if "%" not in path and os.path.isfile(path):
+            return path, label
+    return None
+
+
+def pick_instagram_cookies(cookie_list):
+    """从 CDP 返回的 Cookie 数组里挑出 instagram.com 的，返回 {name: value}。"""
+    result = {}
+    for item in cookie_list or []:
+        try:
+            domain = str(item.get("domain") or "")
+            name = item.get("name")
+            if name and "instagram.com" in domain:
+                result[name] = item.get("value") or ""
+        except Exception:
+            continue
+    return result
 
 
 DEFAULT_SETTINGS = {
@@ -317,6 +373,7 @@ class App:
         self.settings = load_settings()
         self.msg_queue = queue.Queue()
         self.stop_flag = threading.Event()
+        self._browser_login_stop = threading.Event()
         self.downloading = False
         self.logged_in_user = ""
 
@@ -362,7 +419,8 @@ class App:
 
         row2 = tk.Frame(login_frame)
         row2.pack(fill="x", pady=(6, 0))
-        tk.Button(row2, text="登录并保存", width=12, command=self.on_password_login).pack(side="left")
+        tk.Button(row2, text="打开浏览器登录", width=13, command=self.on_browser_window_login).pack(side="left")
+        tk.Button(row2, text="登录并保存", width=12, command=self.on_password_login).pack(side="left", padx=(6, 0))
         tk.Button(row2, text="读取Edge登录", width=12, command=self.on_edge_login).pack(side="left", padx=(6, 0))
         tk.Button(row2, text="读取Chrome登录", width=13, command=self.on_chrome_login).pack(side="left", padx=(6, 0))
         tk.Button(row2, text="退出登录", width=9, command=self.on_logout).pack(side="left", padx=(6, 0))
@@ -379,8 +437,10 @@ class App:
         tk.Button(cbtn, text="Cookie登录并保存", command=self.on_cookie_login).pack()
 
         tk.Label(login_frame, anchor="w", fg="#666666",
-                 text="浏览器登录：先在 Edge 或 Chrome 里登录好 Instagram，再把浏览器完全关掉，然后点对应的“读取…登录”"
-                      "（Chrome 新版加密严，可能读不到，读不到就用 Cookie 粘贴）。\n"
+                 text="浏览器登录（推荐）：点“打开浏览器登录”，会弹出一个软件专用的 Edge 窗口，你在里面正常登录一次，软件自己读回来保存；"
+                      "以后再点这个按钮，没过期就直接完成，不用再登。\n"
+                      "读取浏览器登录：先在 Edge 或 Chrome 里登录好 Instagram，再把浏览器完全关掉，然后点对应的“读取…登录”"
+                      "（Chrome 新版加密严，可能读不到，读不到就用上面的浏览器登录）。\n"
                       "Cookie登录：在浏览器里登录好 Instagram，复制整串 Cookie 粘贴到上面，点“Cookie登录并保存”（必须包含 sessionid）。\n"
                       f"数据都存在程序旁边：{DATA_DIR}（登录保存）和下载文件夹里，不放 AppData。").pack(fill="x", pady=(4, 0))
 
@@ -528,6 +588,7 @@ class App:
         self._save_settings_from_ui()
 
     def on_close(self):
+        self._browser_login_stop.set()
         self._save_settings_from_ui()
         self.root.destroy()
 
@@ -619,6 +680,168 @@ class App:
         self.log("读取Chrome登录前确认一下：先在 Chrome 里登录好 Instagram，再把 Chrome 完全关掉（窗口全关），不然读不到。开始读取…")
         self.login_status_var.set("登录状态：正在读取Chrome登录…")
         threading.Thread(target=self._browser_login_worker, args=("chrome", "Chrome"), daemon=True).start()
+
+    def on_browser_window_login(self):
+        self._browser_login_stop.clear()
+        self.login_status_var.set("登录状态：等待浏览器登录…")
+        threading.Thread(target=self._browser_window_login_worker, daemon=True).start()
+
+    def _cdp_get_json(self, path, timeout=3):
+        """连本机专用浏览器的调试口取 JSON。
+
+        必须用 ProxyHandler({}) 明确不走代理：用户的代理软件会把
+        localhost 的请求也拦走，不绕开就永远连不上调试口。
+        """
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:9333{path}", timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+
+    def _read_cdp_cookies(self):
+        """通过 CDP 从专用浏览器窗口读全部 Cookie，挑出 Instagram 的返回；读不到返回 {}。"""
+        targets = self._cdp_get_json("/json/list", timeout=3)
+        target = None
+        if isinstance(targets, list):
+            for t in targets:
+                if (isinstance(t, dict) and t.get("webSocketDebuggerUrl")
+                        and "instagram.com" in str(t.get("url") or "")):
+                    target = t
+                    break
+            if target is None:
+                for t in targets:
+                    if (isinstance(t, dict) and t.get("type") == "page"
+                            and t.get("webSocketDebuggerUrl")):
+                        target = t
+                        break
+        if target is None:
+            return {}
+        import websocket  # 懒加载，打包缺失时只影响这个功能
+
+        ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=5)
+        try:
+            ws.send(json.dumps({"id": 1, "method": "Network.getAllCookies", "params": {}}))
+            ws.settimeout(10)
+            end = time.monotonic() + 10
+            while time.monotonic() < end:
+                try:
+                    raw = ws.recv()
+                except Exception:
+                    break
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                if msg.get("id") == 1:
+                    cookie_list = ((msg.get("result") or {}).get("cookies")) or []
+                    return pick_instagram_cookies(cookie_list)
+            return {}
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _close_dedicated_browser(self):
+        """登录成功后关掉专用浏览器窗口；关不掉就算了，提醒用户手动关。"""
+        try:
+            version = self._cdp_get_json("/json/version", timeout=3)
+            ws_url = (version or {}).get("webSocketDebuggerUrl")
+            if not ws_url:
+                raise RuntimeError("没有拿到浏览器调试地址")
+            import websocket
+
+            ws = websocket.create_connection(ws_url, timeout=5)
+            try:
+                ws.send(json.dumps({"id": 1, "method": "Browser.close", "params": {}}))
+            finally:
+                ws.close()
+        except Exception:
+            self.log("专用浏览器窗口没自动关，你手动关掉就行。")
+
+    def _browser_window_login_worker(self):
+        # websocket 只在这里懒加载，缺了只影响这一种登录方式
+        try:
+            import websocket  # noqa: F401
+        except Exception:
+            self.msg_queue.put(("status", "登录状态：未登录"))
+            self.log("缺少 websocket 组件，用不了浏览器登录（打包版里是带好的，出现这个说明打包不完整）。")
+            return
+        found = find_browser()
+        if not found:
+            self.msg_queue.put(("status", "登录状态：未登录"))
+            self.log("没有找到 Edge 或 Chrome，无法用这个方式。请改用账号密码登录或 Cookie 粘贴登录。")
+            return
+        exe, label = found
+        profile_dir = DATA_DIR / "browser_profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        # 调试口已经在应答，说明专用窗口还开着，直接复用，不重复拉起
+        reused = True
+        try:
+            self._cdp_get_json("/json/version", timeout=3)
+        except Exception:
+            reused = False
+        if not reused:
+            try:
+                subprocess.Popen([
+                    exe,
+                    "--remote-debugging-port=9333",
+                    f"--user-data-dir={profile_dir}",
+                    "--no-first-run",
+                    "--new-window",
+                    "https://www.instagram.com/accounts/login/",
+                ])
+            except Exception as exc:
+                self.msg_queue.put(("status", "登录状态：未登录"))
+                self.log(f"打开专用 {label} 窗口失败：{exc}")
+                return
+        self.log(f"已打开专用{label}窗口，请在里面登录 Instagram，登好不用管，软件会自动读回来…")
+        self.msg_queue.put(("status", "登录状态：等待浏览器登录…"))
+
+        loader = make_loader(self.speed_var.get())
+        deadline = time.monotonic() + 300
+        verify_failed_noted = False
+        last_wait_log = 0.0
+        while time.monotonic() < deadline:
+            if self._browser_login_stop.is_set():
+                self.log("浏览器登录已取消。")
+                self.msg_queue.put(("status", "登录状态：未登录"))
+                return
+            try:
+                cookies = self._read_cdp_cookies()
+            except Exception:
+                # 浏览器可能还在启动，读不到就继续等
+                cookies = {}
+            if cookies.get("sessionid"):
+                who = None
+                try:
+                    who = verify_login(loader, cookies)
+                except Exception:
+                    who = None
+                if who:
+                    try:
+                        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+                        loader.save_session_to_file(filename=str(session_path(who)))
+                        self.logged_in_user = who
+                        self.settings["login_username"] = who
+                        save_settings(self.settings)
+                    except Exception as exc:
+                        self.log(f"登录读到了，但保存失败：{exc}")
+                    self.msg_queue.put(("status", f"登录状态：已登录 {who}"))
+                    self.log(f"浏览器登录成功，已保存：{who}。以后打开软件会自动恢复登录；"
+                             "再点“打开浏览器登录”，没过期就直接完成，不用再登。")
+                    self._close_dedicated_browser()
+                    return
+                if not verify_failed_noted:
+                    verify_failed_noted = True
+                    self.log("读到了登录但 Instagram 没认（可能刚登录还没生效），继续等…")
+            else:
+                now = time.monotonic()
+                if now - last_wait_log >= 20:
+                    last_wait_log = now
+                    self.log("还在等你登录…（在弹出的窗口里登好就行，不用复制任何东西）")
+            self._browser_login_stop.wait(timeout=2)
+        self.msg_queue.put(("status", "登录状态：未登录"))
+        self.log("等了5分钟还没读到登录，这次先取消。要再试就再点一次按钮。")
 
     def _browser_login_worker(self, kind, label):
         try:

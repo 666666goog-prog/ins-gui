@@ -1,10 +1,11 @@
-# Ins批量下载 v1.0.2
+# Ins批量下载 v1.0.3
 
 给开源工具 **Instaloader 4.16** 套的图形界面：全中文、鼠标操作、批量按账号下载 Instagram 帖子 / Reels / 头像 / 快拍 / 精选。
 
 ## 功能
 
-- **两种登录**（登录后能下私密账号、快拍、精选，也更不容易被限流）
+- **登录**（登录后能下私密账号、快拍、精选，也更不容易被限流）
+  - **打开浏览器登录（推荐）**：点「打开浏览器登录」，会弹出一个软件专用的 Edge 窗口（资料在 `data/browser_profile/`），在里面正常登录一次，软件通过本机调试口自己把登录读回来保存；以后再点这个按钮，没过期就直接完成，不用再登
   - 账号密码登录：填用户名+密码点「登录并保存」，登录状态保存在程序旁边的 `data/sessions/`，下次打开自动恢复；开了两步验证的账号会弹窗让你输验证码
   - 读取 Edge 登录：先在 Edge 里登录 Instagram、**把 Edge 完全关掉**，再点「读取Edge登录」
   - 不登录也能用，只能下公开账号
@@ -32,8 +33,8 @@ python test_logic.py
 仓库带了 GitHub Actions 手动构建（`.github/workflows/build-windows.yml`）：
 
 1. 推到 GitHub 后，进仓库 **Actions** 页，选 **Build Windows**，点 **Run workflow**
-2. 构建完在该次运行底部下载产物 `InsDownloader_Windows_X64_v1.0.2`
-3. 里面是 `InsDownloader_Windows_X64_v1.0.2.zip`，解压后双击文件夹里的 `InsDownloader_v1.0.2.exe` 使用（onedir 模式，exe 和旁边的文件要在一起，不要单独把 exe 拷出来）
+2. 构建完在该次运行底部下载产物 `InsDownloader_Windows_X64_v1.0.3`
+3. 里面是 `InsDownloader_Windows_X64_v1.0.3.zip`，解压后双击文件夹里的 `InsDownloader_v1.0.3.exe` 使用（onedir 模式，exe 和旁边的文件要在一起，不要单独把 exe 拷出来）
 
 ## 已知限制（v1）
 
@@ -45,6 +46,7 @@ python test_logic.py
 
 ## 技术说明
 
-- 单文件 GUI：`app.py`（tkinter），只依赖 `instaloader==4.16` 和 `browser-cookie3`
+- 单文件 GUI：`app.py`（tkinter），依赖 `instaloader==4.16`、`browser-cookie3`、`websocket-client`（浏览器登录走 CDP 用）
+- 浏览器登录连本机调试口时强制不走代理（`ProxyHandler({})`），且启动时把 `localhost,127.0.0.1` 加进 `NO_PROXY`，避免用户的代理软件拦截 localhost
 - 下载逐条手动迭代 `Profile.get_posts()` / `get_reels()`，方便计数、停止和分类；没有用 `download_profile`
 - Instaloader 4.16 没有 `download_highlight()` 方法，精选是遍历 `get_highlights()` 后逐条 `download_storyitem()` 下的；Reels 方法名是 `get_reels()`（不是 `get_reels_posts()`）

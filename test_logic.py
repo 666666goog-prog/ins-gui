@@ -105,6 +105,34 @@ def test_settings_roundtrip():
     print("PASS settings save/load")
 
 
+def test_pick_instagram_cookies():
+    arr = [
+        {"name": "sessionid", "value": "s1", "domain": ".instagram.com"},
+        {"name": "csrftoken", "value": "t1", "domain": ".instagram.com"},
+        {"name": "www", "value": "z", "domain": "www.instagram.com"},
+        {"name": "other", "value": "x", "domain": ".google.com"},
+        {"name": "nodomain", "value": "y", "domain": ""},
+        {"value": "noname", "domain": ".instagram.com"},
+        "not-a-dict",
+        None,
+    ]
+    got = app.pick_instagram_cookies(arr)
+    assert got == {"sessionid": "s1", "csrftoken": "t1", "www": "z"}, got
+    assert app.pick_instagram_cookies([]) == {}
+    assert app.pick_instagram_cookies(None) == {}
+    print("PASS pick_instagram_cookies")
+
+
+def test_no_proxy_includes_loopback():
+    # 启动时必须把回环加进 NO_PROXY，不然连不上本机浏览器调试口
+    import os
+
+    for var in ("NO_PROXY", "no_proxy"):
+        parts = [p.strip() for p in os.environ.get(var, "").split(",")]
+        assert "localhost" in parts and "127.0.0.1" in parts, (var, os.environ.get(var))
+    print("PASS no_proxy loopback")
+
+
 def test_paths_are_portable():
     # 数据必须在程序旁边，不能是 AppData
     assert app.DATA_DIR.parent == app.BASE_DIR
@@ -118,6 +146,8 @@ if __name__ == "__main__":
     test_parse_targets()
     test_parse_cookie_string()
     test_derive_user_id_and_sessionid_shape()
+    test_pick_instagram_cookies()
+    test_no_proxy_includes_loopback()
     test_settings_roundtrip()
     test_paths_are_portable()
     print("全部通过")

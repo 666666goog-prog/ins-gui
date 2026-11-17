@@ -1,2 +1,3 @@
 instaloader==4.16
 browser-cookie3
+websocket-client
