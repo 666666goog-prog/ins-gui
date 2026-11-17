@@ -105,24 +105,6 @@ def test_settings_roundtrip():
     print("PASS settings save/load")
 
 
-def test_pick_instagram_cookies():
-    arr = [
-        {"name": "sessionid", "value": "s1", "domain": ".instagram.com"},
-        {"name": "csrftoken", "value": "t1", "domain": ".instagram.com"},
-        {"name": "www", "value": "z", "domain": "www.instagram.com"},
-        {"name": "other", "value": "x", "domain": ".google.com"},
-        {"name": "nodomain", "value": "y", "domain": ""},
-        {"value": "noname", "domain": ".instagram.com"},
-        "not-a-dict",
-        None,
-    ]
-    got = app.pick_instagram_cookies(arr)
-    assert got == {"sessionid": "s1", "csrftoken": "t1", "www": "z"}, got
-    assert app.pick_instagram_cookies([]) == {}
-    assert app.pick_instagram_cookies(None) == {}
-    print("PASS pick_instagram_cookies")
-
-
 def test_no_proxy_includes_loopback():
     # 启动时必须把回环加进 NO_PROXY，不然连不上本机浏览器调试口
     import os
@@ -141,13 +123,49 @@ def test_paths_are_portable():
     print("PASS portable paths:", app.DATA_DIR)
 
 
+def test_verify_login_timed():
+    # 限时校验：快回 ok、慢回必须 timeout 且中途有进度日志，绝不静默卡死
+    import time as _time
+
+    class _Ctx:
+        sleep = True
+
+    class _Loader:
+        def __init__(self):
+            self.context = _Ctx()
+
+    orig = app.verify_login
+    try:
+        app.verify_login = lambda loader, cookies: "someuser"
+        assert app.verify_login_timed(_Loader(), {}, lambda m: None, timeout=10) == ("ok", "someuser")
+
+        app.verify_login = lambda loader, cookies: None
+        assert app.verify_login_timed(_Loader(), {}, lambda m: None, timeout=10) == ("bad", None)
+
+        def _slow(loader, cookies):
+            _time.sleep(30)
+            return "late"
+
+        app.verify_login = _slow
+        logs = []
+        t0 = _time.monotonic()
+        result = app.verify_login_timed(_Loader(), {}, logs.append, timeout=12)
+        elapsed = _time.monotonic() - t0
+        assert result == ("timeout", None), result
+        assert elapsed < 20, elapsed
+        assert any("正在向 Instagram 确认" in m for m in logs), logs
+    finally:
+        app.verify_login = orig
+    print("PASS verify_login_timed")
+
+
 if __name__ == "__main__":
     test_extract_username()
     test_parse_targets()
     test_parse_cookie_string()
     test_derive_user_id_and_sessionid_shape()
-    test_pick_instagram_cookies()
     test_no_proxy_includes_loopback()
     test_settings_roundtrip()
     test_paths_are_portable()
+    test_verify_login_timed()
     print("全部通过")
