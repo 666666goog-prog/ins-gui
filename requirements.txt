@@ -1,1 +1,1 @@
-instaloader==4.16
+instagrapi==3.2.15

@@ -1,1130 +1,439 @@
 # -*- coding: utf-8 -*-
-"""
-Ins批量下载 v1.0.6
-基于开源 Instaloader 4.16 的图形界面，全中文、鼠标操作为主。
+"""ins批量下载器 v2.0.0 — instagrapi 发动机（手机 App 私有接口）
 
-便携规则：所有数据都放在程序旁边的文件夹里，绝不写 AppData。
-  data/            设置和登录保存
-  data/sessions/   登录凭证（session 文件）
-  下载/            默认下载位置
+登录：粘贴浏览器 Cookie（只用其中的 sessionid），保存后下次不用再粘。
+下载：输入用户名，一次下完该账号全部帖子 + Reels，按 图片/视频/Reels/图文
+分文件夹，已下载的自动跳过。引擎逻辑与桌面实测版 batch_core 一致。
 """
-
 import json
-import os
 import queue
 import re
-import socket
 import sys
 import threading
-import time
-import urllib.parse
-import urllib.request
-from datetime import datetime
+import tkinter as tk
 from pathlib import Path
+from tkinter import filedialog, scrolledtext, ttk
+import urllib.request
 
-# 本机回环地址绝不能走代理：软件要连本机专用浏览器的调试口（localhost），
-# 用户的代理软件会把这类请求也拦走，所以启动时（任何联网之前）先把回环加进 NO_PROXY。
-for _proxy_var in ("NO_PROXY", "no_proxy"):
-    _parts = [p.strip() for p in os.environ.get(_proxy_var, "").split(",") if p.strip()]
-    for _host in ("localhost", "127.0.0.1"):
-        if _host not in _parts:
-            _parts.append(_host)
-    os.environ[_proxy_var] = ",".join(_parts)
+VERSION = "2.0.0"
 
+# ---------------------------------------------------------------- engine
 
-# ---------------------------------------------------------------------------
-# 网络修正（v1.0.6）：让程序的请求和浏览器一样顺畅到达 Instagram
-# ---------------------------------------------------------------------------
-
-def _filter_ipv4(results):
-    """getaddrinfo 的结果只留 IPv4（只要有 IPv4 可用）。
-
-    Python 连地址是挨个试的：IPv6 路由不通时，它会等满超时才换下一个；
-    浏览器有快速切换所以不卡。这是“浏览器快、程序慢”的常见根源。
-    """
-    v4 = [r for r in results if r[0] == socket.AF_INET]
-    return v4 if v4 else results
+def extract_sessionid(text: str) -> str:
+    text = (text or "").strip()
+    m = re.search(r"sessionid=([^;\s]+)", text)
+    if m:
+        return m.group(1)
+    return text
 
 
-_orig_getaddrinfo = socket.getaddrinfo
+def make_client(sessionid: str, proxy: str = ""):
+    """Logged-in Client validated ONLY via the private mobile API (account_info).
+    private_transport='requests' avoids the curl_cffi stack entirely."""
+    from instagrapi import Client
 
-
-def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
-    return _filter_ipv4(_orig_getaddrinfo(host, port, family, type, proto, flags))
-
-
-socket.getaddrinfo = _getaddrinfo_ipv4
-
-
-def _apply_system_proxy():
-    """把 Windows 系统代理读出来写进环境变量，让 requests 全程走代理。
-
-    浏览器会自动用系统代理；Python 的 requests 不一定认（尤其是
-    “自动配置脚本”那种设置），认不到就会去直连被墙的地址、干等超时。
-    写进环境变量后，程序里新建的每个会话都会在发请求时自动带上。
-    返回一句给日志看的说明；代理地址是本机地址（如 127.0.0.1:7890），
-    不是账号信息，可以打进日志。
-    """
+    cl = Client(private_transport="requests")
     try:
-        proxies = urllib.request.getproxies() or {}
+        cl.delay_range = [1, 3]
+    except Exception:
+        pass
+    if proxy:
+        try:
+            cl.set_proxy(proxy)
+        except Exception:
+            pass
+    user_id = re.match(r"\d+", sessionid).group()
+    cl.settings["cookies"] = {"sessionid": sessionid}
+    cl.init()
+    cl.authorization_data = {
+        "ds_user_id": user_id,
+        "sessionid": sessionid,
+        "should_use_header_over_cookies": True,
+    }
+    cl.private.cookies.set("ds_user_id", user_id)
+    cl.private.headers.update(cl.base_headers)
+    cl.private.headers.update({"Authorization": cl.authorization})
+    info = cl.account_info()
+    cl.username = info.username
+    return cl
+
+
+def classify(media) -> str:
+    if media.product_type == "clips":
+        return "Reels"
+    if media.media_type == 1:
+        return "图片"
+    if media.media_type == 2:
+        return "视频"
+    if media.media_type == 8:
+        return "图文"
+    return "其他"
+
+
+def fetch_all(cl, user_id: int, log, should_stop=None):
+    """All feed medias + all clips, deduped, manual pagination (50/page)."""
+    seen = {}
+    cursor = ""
+    pages = 0
+    while True:
+        if should_stop and should_stop():
+            break
+        batch, cursor = cl.user_medias_paginated_v1(user_id, amount=50, end_cursor=cursor)
+        for md in batch:
+            seen[str(md.pk)] = md
+        pages += 1
+        log(f"帖子第 {pages} 页：累计 {len(seen)} 个")
+        if not cursor or not batch:
+            break
+        if pages >= 400:
+            log("达到安全上限，停止翻页")
+            break
+    try:
+        cursor = ""
+        pages = 0
+        while True:
+            if should_stop and should_stop():
+                break
+            batch, cursor = cl.user_clips_paginated_v1(user_id, amount=50, end_cursor=cursor)
+            new = 0
+            for md in batch:
+                if str(md.pk) not in seen:
+                    new += 1
+                seen[str(md.pk)] = md
+            pages += 1
+            log(f"Reels 第 {pages} 页：本页新增 {new}，累计 {len(seen)} 个")
+            if not cursor or not batch:
+                break
+            if pages >= 400:
+                break
+    except Exception as e:
+        log(f"Reels 列表没拉完（{type(e).__name__}），已拉到的照常下载")
+    return list(seen.values())
+
+
+def _fname(media, idx=None):
+    date = media.taken_at.strftime("%Y-%m-%d") if media.taken_at else "0000-00-00"
+    base = f"{date}_{media.code}"
+    if idx is not None:
+        base += f"_{idx}"
+    return base
+
+
+def download_one(cl, media, dest_dir: Path, log) -> str:
+    kind = classify(media)
+    folder = dest_dir / kind
+    folder.mkdir(parents=True, exist_ok=True)
+    jobs = []
+    if media.media_type == 8:
+        for i, res in enumerate(media.resources or [], start=1):
+            if res.media_type == 2:
+                jobs.append((res.video_url, _fname(media, i), True))
+            else:
+                jobs.append((res.thumbnail_url, _fname(media, i), False))
+    elif media.media_type == 2:
+        jobs.append((media.video_url, _fname(media), True))
+    else:
+        jobs.append((media.thumbnail_url, _fname(media), False))
+
+    got_any = False
+    skipped_all = True
+    for url, fname, is_video in jobs:
+        if not url:
+            skipped_all = False
+            continue
+        ext = ".mp4" if is_video else ".jpg"
+        target = folder / f"{fname}{ext}"
+        if target.exists() and target.stat().st_size > 0:
+            got_any = True
+            continue
+        skipped_all = False
+        try:
+            if is_video:
+                cl.video_download_by_url(url, fname, folder)
+            else:
+                cl.photo_download_by_url(url, fname, folder)
+            if target.exists() and target.stat().st_size > 0:
+                got_any = True
+            elif list(folder.glob(fname + ".*")):
+                got_any = True
+        except Exception as e:
+            log(f"    失败 {fname}：{type(e).__name__} {str(e)[:120]}")
+    if got_any and skipped_all:
+        return "skip"
+    return "ok" if got_any else "fail"
+
+
+def run_batch(cl, username: str, base_dir: Path, log, should_stop=None, progress=None):
+    user_id = cl.user_id_from_username(username)
+    info = cl.user_info(user_id)
+    log(f"目标 @{username}：帖子数 {info.media_count}，粉丝 {info.follower_count}")
+    medias = fetch_all(cl, user_id, log, should_stop)
+    log(f"共取到 {len(medias)} 个作品（帖子+Reels 合并去重后），开始下载")
+    dest = Path(base_dir) / username
+    dest.mkdir(parents=True, exist_ok=True)
+    stats = {"ok": 0, "skip": 0, "fail": 0}
+    for i, md in enumerate(medias, start=1):
+        if should_stop and should_stop():
+            log("已停止")
+            break
+        r = download_one(cl, md, dest, log)
+        stats[r] += 1
+        if progress:
+            progress(i, len(medias))
+        if i % 20 == 0:
+            log(f"进度 {i}/{len(medias)}（新下 {stats['ok']}，跳过 {stats['skip']}，失败 {stats['fail']}）")
+    log(f"完成：新下 {stats['ok']}，跳过 {stats['skip']}，失败 {stats['fail']}，共 {len(medias)}")
+    return stats
+
+
+# ---------------------------------------------------------------- settings
+
+def app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+SETTINGS_FILE = app_dir() / "ins_batch_settings.json"
+
+
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_settings(data: dict):
+    try:
+        SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def detect_proxy() -> str:
+    try:
+        proxies = urllib.request.getproxies()
+        return proxies.get("https") or proxies.get("http") or ""
     except Exception:
         return ""
-    applied = []
-    for scheme in ("http", "https"):
-        url = proxies.get(scheme)
-        if not url:
-            continue
-        for var in (f"{scheme.upper()}_PROXY", f"{scheme}_proxy"):
-            if not os.environ.get(var):
-                os.environ[var] = url
-        applied.append(f"{scheme}={url}")
-    return "，".join(applied)
 
 
-SYSTEM_PROXY_NOTE = _apply_system_proxy()
-
-# ---------------------------------------------------------------------------
-# 路径（便携：永远在 exe / 脚本旁边）
-# ---------------------------------------------------------------------------
-
-def get_base_dir() -> Path:
-    """打包成 exe 时用 exe 所在文件夹；直接跑脚本时用脚本所在文件夹。"""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-BASE_DIR = get_base_dir()
-DATA_DIR = BASE_DIR / "data"
-SESSIONS_DIR = DATA_DIR / "sessions"
-SETTINGS_FILE = DATA_DIR / "settings.json"
-DEFAULT_DOWNLOAD_DIR = BASE_DIR / "下载"
-
-APP_TITLE = "Ins批量下载 v1.0.6"
-VERSION = "1.0.6"
-
-# ---------------------------------------------------------------------------
-# 纯逻辑（不打开窗口、不联网，test_logic.py 会测这部分）
-# ---------------------------------------------------------------------------
-
-_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
-# 这些是 Instagram 网址里的固定栏目词，不是用户名
-_RESERVED_SEGMENTS = {
-    "p", "reel", "reels", "stories", "explore", "accounts",
-    "direct", "tv", "igtv", "about", "developer", "legal",
-}
-
-
-def extract_username(text):
-    """从一行文字里提取 Instagram 用户名。
-
-    支持：nasa / @nasa / https://www.instagram.com/nasa/ 等写法。
-    提不出来（比如帖子链接 instagram.com/p/xxxx）返回 None。
-    """
-    if text is None:
-        return None
-    s = str(text).strip()
-    if not s:
-        return None
-    if "instagram.com" in s.lower():
-        # 取 instagram.com/ 后面的第一段
-        part = s[s.lower().index("instagram.com") + len("instagram.com"):]
-        part = part.strip("/")
-        segment = re.split(r"[/?#\s]", part)[0] if part else ""
-        if not segment or segment.lower() in _RESERVED_SEGMENTS:
-            return None
-        s = segment
-    else:
-        s = s.strip()
-        if s.startswith("@"):
-            s = s[1:]
-        s = s.strip().strip("/")
-    if _USERNAME_RE.match(s or ""):
-        return s
-    return None
-
-
-def parse_targets(text):
-    """把多行文本解析成去重后的用户名列表（一行一个）。"""
-    result = []
-    seen = set()
-    for line in str(text or "").splitlines():
-        name = extract_username(line)
-        if name and name.lower() not in seen:
-            seen.add(name.lower())
-            result.append(name)
-    return result
-
-
-def parse_cookie_string(text):
-    """把整串 Cookie 文字解析成字典。
-
-    支持浏览器里复制出来的整行 Cookie（可带 "Cookie:" 前缀），
-    值里可以含 "="（只按第一个 "=" 切分）。解析不出来返回空字典。
-    """
-    s = str(text or "").strip()
-    if not s:
-        return {}
-    # 去掉请求头复制时带的前缀
-    if s.lower().startswith("cookie:"):
-        s = s[len("cookie:"):].strip()
-    s = s.replace("\r", " ").replace("\n", " ")
-    cookies = {}
-    for part in s.split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        name, value = part.split("=", 1)
-        name = name.strip()
-        value = value.strip()
-        if name:
-            cookies[name] = value
-    return cookies
-
-
-def derive_user_id(cookies):
-    """从 Cookie 里推出自己的数字 ID：先看 ds_user_id，没有就从 sessionid 第一段拆。"""
-    uid = str((cookies or {}).get("ds_user_id") or "").strip()
-    if uid.isdigit():
-        return uid
-    sid = urllib.parse.unquote(str((cookies or {}).get("sessionid") or ""))
-    first = sid.split(":")[0].strip() if sid else ""
-    return first if first.isdigit() else ""
-
-
-def sessionid_looks_complete(cookies):
-    """sessionid 正常是一长串、解码后至少有两段冒号分隔；只剩一截就是没复制全。"""
-    sid = urllib.parse.unquote(str((cookies or {}).get("sessionid") or ""))
-    return sid.count(":") >= 2 and len(sid) >= 30
-
-
-def verify_login(loader, cookies):
-    """校验 Cookie 登录，返回用户名或 None。
-
-    先用库自带的 test_login；它偶尔会误判（返回空但登录其实有效），
-    再用 ds_user_id 查本人资料兜底（网页接口、手机接口各一道），
-    查到用户名就算登录成立。
-    """
-    loader.context.update_cookies(cookies)
-    who = None
-    try:
-        who = loader.test_login()
-    except Exception:
-        who = None
-    if who:
-        return who
-    uid = derive_user_id(cookies)
-    if uid:
-        try:
-            from instaloader.structures import Profile
-
-            prof = Profile.from_id(loader.context, int(uid))
-            if prof is not None and prof.username:
-                return prof.username
-        except Exception:
-            pass
-        # 第三道兜底：走手机接口按 ID 查本人资料
-        try:
-            data = loader.context.get_iphone_json(f"api/v1/users/{uid}/info/", {})
-            username = ((data or {}).get("user") or {}).get("username")
-            if username:
-                return username
-        except Exception:
-            pass
-    return None
-
-
-def _verify_checks(cookies):
-    """三道校验各做成一个无参函数，返回 [(名字, 函数)]，函数返回用户名或 None。
-
-    每道用独立的 loader（不共用会话，免得并行时互相干扰），并且都改成
-    快速失败：单次请求最多等 15 秒（原版默认 300 秒）、最多重试 2 次、
-    不做请求前等待。v1.0.4 在用户机器上 45 秒超时的根源就是原版的
-    300 秒请求超时叠加一道道串行重试——一个请求卡住就能吃掉全部时间。
-    """
-    def _mk(fn):
-        sub = make_loader("快速", request_timeout=15)
-        try:
-            sub.context.sleep = False
-            sub.context.request_timeout = 15
-            sub.context.max_connection_attempts = 2
-        except Exception:
-            pass
-        sub.context.update_cookies(cookies)
-        return lambda: fn(sub)
-
-    def _by_test_login(sub):
-        try:
-            return sub.test_login()
-        except Exception:
-            return None
-
-    def _by_profile(sub):
-        uid = derive_user_id(cookies)
-        if not uid:
-            return None
-        try:
-            from instaloader.structures import Profile
-
-            prof = Profile.from_id(sub.context, int(uid))
-            return prof.username if prof is not None else None
-        except Exception:
-            return None
-
-    def _by_iphone(sub):
-        uid = derive_user_id(cookies)
-        if not uid:
-            return None
-        try:
-            data = sub.context.get_iphone_json(f"api/v1/users/{uid}/info/", {})
-            return ((data or {}).get("user") or {}).get("username")
-        except Exception:
-            return None
-
-    return [("官方检查", _mk(_by_test_login)),
-            ("按账号ID查资料", _mk(_by_profile)),
-            ("手机接口", _mk(_by_iphone))]
-
-
-def verify_login_timed(loader, cookies, log, timeout=90):
-    """限时校验：三道检查同时赛跑，哪道先查到用户名就用哪道。
-
-    返回 (状态, 用户名)，状态为 ok / bad / timeout。
-    v1.0.3 的教训：校验同步串行跑，撞上限流能在一步里睡好几分钟还不吐字。
-    v1.0.4 的教训：串行 + 原版 300 秒请求超时，用户网络慢时 45 秒根本不够
-    三道走完。所以 v1.0.5 改成并行赛跑 + 每道快速失败，全程每 10 秒报
-    一次进度，超过上限明确报超时，绝不静默卡住。
-    """
-    try:
-        loader.context.sleep = False
-        loader.context.request_timeout = 15
-        loader.context.max_connection_attempts = 2
-    except Exception:
-        pass
-    loader.context.update_cookies(cookies)
-    checks = _verify_checks(cookies)
-    results = {}
-    lock = threading.Lock()
-
-    def _run(name, fn):
-        try:
-            who = fn()
-        except Exception:
-            who = None
-        with lock:
-            results[name] = who
-
-    for name, fn in checks:
-        threading.Thread(target=_run, args=(name, fn), daemon=True).start()
-    waited = 0
-    while waited < timeout:
-        with lock:
-            done = len(results)
-            winners = [(n, w) for n, w in results.items() if w]
-        if winners:
-            name, who = winners[0]
-            log(f"确认通过（走的是“{name}”这道）")
-            return ("ok", who)
-        if done >= len(checks):
-            return ("bad", None)
-        time.sleep(2)
-        waited += 2
-        if waited % 10 == 0:
-            with lock:
-                done = len(results)
-            if done < len(checks):
-                log(f"正在向 Instagram 确认这个登录…已等 {waited} 秒（最多等 {timeout} 秒）")
-    with lock:
-        winners = [(n, w) for n, w in results.items() if w]
-    if winners:
-        name, who = winners[0]
-        log(f"确认通过（走的是“{name}”这道）")
-        return ("ok", who)
-    return ("timeout", None)
-
-
-def _net_self_check(log):
-    """校验前先量一下到 Instagram 的连通性，把结果打进日志。
-
-    这样日志能直接区分：是根本连不通/慢（网络路径问题），
-    还是连得通但 ins 不认这个登录（登录本身的问题）。
-    """
-    import requests
-
-    t0 = time.monotonic()
-    try:
-        resp = requests.get("https://www.instagram.com/", timeout=10)
-        log(f"网络自检：打开 Instagram 首页用了 {time.monotonic() - t0:.1f} 秒"
-            f"（状态 {resp.status_code}），网络这条路是通的")
-    except Exception as exc:
-        log(f"网络自检：打开 Instagram 首页失败（{type(exc).__name__}），"
-            f"耗了 {time.monotonic() - t0:.1f} 秒——连首页都到不了，校验更到不了，"
-            "问题在网络路径（代理没被程序用上之类），不在登录本身")
-
-
-DEFAULT_SETTINGS = {
-    "login_username": "",
-    "download_dir": "",
-    "opt_posts": True,
-    "opt_profilepic": True,
-    "opt_reels": True,
-    "opt_stories": False,
-    "opt_highlights": False,
-    "opt_classify": True,
-    "opt_only_video": False,
-    "opt_only_image": False,
-    "opt_skip_existing": True,
-    "speed": "正常",
-}
-
-
-def load_settings(path=SETTINGS_FILE):
-    """读设置；文件不存在或坏了就用默认值。"""
-    settings = dict(DEFAULT_SETTINGS)
-    try:
-        p = Path(path)
-        if p.is_file():
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                for key in settings:
-                    if key in data:
-                        settings[key] = data[key]
-    except Exception:
-        pass
-    return settings
-
-
-def save_settings(settings, path=SETTINGS_FILE):
-    """保存设置到 data/settings.json。"""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    merged = dict(DEFAULT_SETTINGS)
-    merged.update({k: v for k, v in dict(settings).items() if k in DEFAULT_SETTINGS})
-    p.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
-    return merged
-
-
-def session_path(username):
-    return SESSIONS_DIR / f"session-{username}"
-
-
-def explain_error(exc):
-    """把引擎报的错误翻成大白话中文，并带上真实原因。"""
-    import instaloader
-
-    msg = str(exc) or exc.__class__.__name__
-    low = msg.lower()
-    if isinstance(exc, instaloader.TooManyRequestsException) or "429" in msg:
-        return ("被 Instagram 限流了（429）：短时间请求太多。"
-                "先停一会儿（几十分钟到几小时），登录后再下也会好一些；"
-                "速度选了“快速”时更容易这样，可以改回“正常”。原始信息：" + msg)
-    if isinstance(exc, instaloader.LoginRequiredException):
-        return "这个内容需要先登录才能下载（比如快拍、私密账号）。原始信息：" + msg
-    if isinstance(exc, instaloader.PrivateProfileNotFollowedException):
-        return "对方是私密账号，你登录的账号还没有关注他/没有通过关注，所以下不了。"
-    if isinstance(exc, instaloader.ProfileNotExistsException):
-        return "这个账号不存在（可能改名、注销或被封了）：原始信息：" + msg
-    if isinstance(exc, instaloader.BadCredentialsException):
-        return "登录失败：用户名或密码不对，或者密码最近改过。原始信息：" + msg
-    if isinstance(exc, instaloader.TwoFactorAuthRequiredException):
-        return "登录需要两步验证码，请输入你收到的验证码。"
-    if "checkpoint" in low:
-        m = re.search(r"https?://\S+", msg)
-        url = m.group(0) if m else "instagram.com"
-        return ("Instagram 要你先做一次安全验证。请在浏览器里打开这个地址、"
-                "按提示确认“是我本人”之后，再回来重新登录：" + url)
-    if isinstance(exc, instaloader.ConnectionException):
-        return "网络连接失败（连不上 Instagram），检查网络/代理后再试。原始信息：" + msg
-    if isinstance(exc, instaloader.LoginException):
-        return "登录没有成功。原始信息：" + msg
-    return f"{exc.__class__.__name__}：{msg}"
-
-
-# ---------------------------------------------------------------------------
-# 下载引擎构造
-# ---------------------------------------------------------------------------
-
-def make_loader(speed="正常", only_video=False, only_image=False, download_dir=None,
-                request_timeout=60):
-    """按“只要媒体文件、不要附加文件”的快设置构造 Instaloader。
-
-    - 不下评论、不下定位、不存 json 元数据、不生成说明 txt —— 少发很多请求，快很多
-    - 速度“快速”时 sleep=False，去掉原版每次请求前的随机等待（更容易被限流）
-    - dirname_pattern 固定到下载文件夹下面，保证所有文件（含头像）都落在下载位置里
-    """
-    import instaloader
-
-    dirname_pattern = "{target}"
-    if download_dir:
-        dirname_pattern = os.path.join(str(download_dir), "{target}")
-    return instaloader.Instaloader(
-        sleep=(speed != "快速"),
-        quiet=True,
-        user_agent=None,
-        dirname_pattern=dirname_pattern,
-        download_pictures=not only_video,
-        download_videos=not only_image,
-        download_video_thumbnails=False,
-        download_geotags=False,
-        download_comments=False,
-        save_metadata=False,
-        compress_json=False,
-        post_metadata_txt_pattern=None,
-        storyitem_metadata_txt_pattern=None,
-        max_connection_attempts=3,
-        request_timeout=request_timeout,
-    )
-
-
-def load_saved_session(loader, username):
-    """把保存过的登录凭证装进 loader。成功返回 True。"""
-    if not username:
-        return False
-    path = session_path(username)
-    if not path.is_file():
-        return False
-    try:
-        loader.load_session_from_file(username, filename=str(path))
-        return True
-    except Exception:
-        return False
-
-
-# ---------------------------------------------------------------------------
-# 图形界面
-# ---------------------------------------------------------------------------
-
-class TwoFactorRequest:
-    """后台线程向主线程要两步验证码的信封。"""
-
-    def __init__(self):
-        self.event = threading.Event()
-        self.code = None
-
+# ---------------------------------------------------------------- GUI
 
 class App:
-    def __init__(self, root):
-        import tkinter as tk
-        from tkinter import scrolledtext
-
-        self.tk = tk
+    def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(APP_TITLE)
-        self.root.geometry("860x700")
-        self.root.minsize(760, 560)
-
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        DEFAULT_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
+        root.title(f"ins批量下载器 v{VERSION}")
+        root.geometry("760x720")
+        self.q = queue.Queue()
+        self.stop_event = threading.Event()
+        self.busy = False
         self.settings = load_settings()
-        self.msg_queue = queue.Queue()
-        self.stop_flag = threading.Event()
-        self.downloading = False
-        self.logged_in_user = ""
 
-        # ---------------- 变量 ----------------
-        s = self.settings
-        self.login_user_var = tk.StringVar(value=s.get("login_username", ""))
-        self.login_pass_var = tk.StringVar(value="")
-        self.show_pass_var = tk.BooleanVar(value=False)
-        self.login_status_var = tk.StringVar(value="登录状态：未登录")
-        self.targets_hint_var = tk.StringVar(value="")
-        self.download_dir_var = tk.StringVar(
-            value=s.get("download_dir") or str(DEFAULT_DOWNLOAD_DIR))
-        self.speed_var = tk.StringVar(value=s.get("speed", "正常"))
-        self.progress_var = tk.StringVar(value="进度：还没开始")
-        self.opt_vars = {
-            "opt_posts": tk.BooleanVar(value=bool(s["opt_posts"])),
-            "opt_profilepic": tk.BooleanVar(value=bool(s["opt_profilepic"])),
-            "opt_reels": tk.BooleanVar(value=bool(s["opt_reels"])),
-            "opt_stories": tk.BooleanVar(value=bool(s["opt_stories"])),
-            "opt_highlights": tk.BooleanVar(value=bool(s["opt_highlights"])),
-            "opt_classify": tk.BooleanVar(value=bool(s["opt_classify"])),
-            "opt_only_video": tk.BooleanVar(value=bool(s["opt_only_video"])),
-            "opt_only_image": tk.BooleanVar(value=bool(s["opt_only_image"])),
-            "opt_skip_existing": tk.BooleanVar(value=bool(s["opt_skip_existing"])),
-        }
+        pad = {"padx": 10, "pady": 4}
 
-        # ---------------- 登录区 ----------------
-        login_frame = tk.LabelFrame(root, text="登录（不登录只能下公开账号，而且更容易被限流）", padx=8, pady=6)
-        login_frame.pack(fill="x", padx=10, pady=(10, 4))
+        tk.Label(root, text="第一步：粘贴 Cookie 登录（保存后下次不用再粘）", font=("", 11, "bold")).pack(anchor="w", **pad)
+        self.cookie_text = tk.Text(root, height=4, font=("", 9))
+        self.cookie_text.pack(fill="x", **pad)
+        row = tk.Frame(root)
+        row.pack(fill="x", **pad)
+        tk.Button(row, text="从剪贴板粘贴", command=self.paste_cookie).pack(side="left")
+        self.btn_login = tk.Button(row, text="保存并登录", command=self.on_login)
+        self.btn_login.pack(side="left", padx=8)
+        self.login_status = tk.Label(row, text="登录状态：未登录")
+        self.login_status.pack(side="left")
 
-        row1 = tk.Frame(login_frame)
-        row1.pack(fill="x")
-        tk.Label(row1, text="用户名：").pack(side="left")
-        self.login_user_entry = tk.Entry(row1, textvariable=self.login_user_var, width=22)
-        self.login_user_entry.pack(side="left")
-        tk.Button(row1, text="粘贴", command=lambda: self._paste_into(self.login_user_var)).pack(side="left", padx=(4, 10))
-        tk.Label(row1, text="密码：").pack(side="left")
-        self.login_pass_entry = tk.Entry(row1, textvariable=self.login_pass_var, width=22, show="*")
-        self.login_pass_entry.pack(side="left")
-        tk.Button(row1, text="粘贴", command=lambda: self._paste_into(self.login_pass_var)).pack(side="left", padx=(4, 6))
-        tk.Checkbutton(row1, text="显示密码", variable=self.show_pass_var,
-                       command=self._toggle_show_pass).pack(side="left")
+        tk.Label(root, text="第二步：输入要下载的账号用户名", font=("", 11, "bold")).pack(anchor="w", **pad)
+        row2 = tk.Frame(root)
+        row2.pack(fill="x", **pad)
+        self.username_entry = tk.Entry(row2, font=("", 12))
+        self.username_entry.pack(side="left", fill="x", expand=True)
+        tk.Button(row2, text="粘贴", command=self.paste_username).pack(side="left", padx=8)
 
-        row2 = tk.Frame(login_frame)
-        row2.pack(fill="x", pady=(6, 0))
-        tk.Button(row2, text="账号密码登录并保存", width=16, command=self.on_password_login).pack(side="left")
-        tk.Button(row2, text="退出登录", width=9, command=self.on_logout).pack(side="left", padx=(6, 0))
-        tk.Label(row2, textvariable=self.login_status_var).pack(side="left", padx=(12, 0))
+        row3 = tk.Frame(root)
+        row3.pack(fill="x", **pad)
+        tk.Label(row3, text="下载到：").pack(side="left")
+        self.dir_entry = tk.Entry(row3)
+        self.dir_entry.pack(side="left", fill="x", expand=True)
+        tk.Button(row3, text="选择文件夹", command=self.choose_dir).pack(side="left", padx=8)
 
-        crow = tk.Frame(login_frame)
-        crow.pack(fill="x", pady=(6, 0))
-        tk.Label(crow, text="Cookie：").pack(side="left", anchor="n")
-        self.cookie_text = scrolledtext.ScrolledText(crow, height=2, wrap="word")
-        self.cookie_text.pack(side="left", fill="x", expand=True)
-        cbtn = tk.Frame(crow)
-        cbtn.pack(side="left", padx=(6, 0), anchor="n")
-        tk.Button(cbtn, text="粘贴", width=10, command=self.on_paste_cookie).pack(pady=(0, 4))
-        tk.Button(cbtn, text="Cookie登录并保存", command=self.on_cookie_login).pack()
+        row4 = tk.Frame(root)
+        row4.pack(fill="x", **pad)
+        tk.Label(row4, text="代理（可空）：").pack(side="left")
+        self.proxy_entry = tk.Entry(row4)
+        self.proxy_entry.pack(side="left", fill="x", expand=True)
+        tk.Label(row4, text="空 = 自动读系统代理；也可填如 http://127.0.0.1:7890").pack(side="left")
 
-        tk.Label(login_frame, anchor="w", fg="#666666",
-                 text="两种登录，任选其一，登好都会保存，下次打开不用再登：\n"
-                      "Cookie登录（推荐）：在浏览器里登录好 Instagram，复制整串 Cookie 粘贴到上面的框里，点“Cookie登录并保存”（必须包含 sessionid，要整行完整的）。\n"
-                      "账号密码登录：在上面填用户名密码，点“账号密码登录并保存”；密码不会保存，只保存登录状态。\n"
-                      f"数据都存在程序旁边：{DATA_DIR}（登录保存）和下载文件夹里，不放 AppData。").pack(fill="x", pady=(4, 0))
+        row5 = tk.Frame(root)
+        row5.pack(fill="x", **pad)
+        self.btn_start = tk.Button(row5, text="开始下载", font=("", 12, "bold"), command=self.on_start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = tk.Button(row5, text="停止", command=self.on_stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=8)
+        self.progress_label = tk.Label(row5, text="")
+        self.progress_label.pack(side="left")
 
-        # ---------------- 下载区 ----------------
-        dl_frame = tk.LabelFrame(root, text="下载账号", padx=8, pady=6)
-        dl_frame.pack(fill="x", padx=10, pady=4)
+        self.progress = ttk.Progressbar(root, mode="determinate", maximum=100)
+        self.progress.pack(fill="x", **pad)
 
-        tk.Label(dl_frame, anchor="w",
-                 text="目标账号（一行一个，可以直接粘贴主页链接，会自动认出用户名）：").pack(fill="x")
-        trow = tk.Frame(dl_frame)
-        trow.pack(fill="x")
-        self.targets_text = scrolledtext.ScrolledText(trow, height=4, wrap="word")
-        self.targets_text.pack(side="left", fill="x", expand=True)
-        tbtn = tk.Frame(trow)
-        tbtn.pack(side="left", padx=(6, 0), anchor="n")
-        tk.Button(tbtn, text="粘贴", width=8, command=self.on_paste_targets).pack(pady=(0, 4))
-        tk.Button(tbtn, text="清空", width=8, command=self.on_clear_targets).pack()
+        tk.Label(root, text="日志", font=("", 11, "bold")).pack(anchor="w", **pad)
+        self.log_text = scrolledtext.ScrolledText(root, height=20, font=("", 9))
+        self.log_text.pack(fill="both", expand=True, **pad)
 
-        orow = tk.Frame(dl_frame)
-        orow.pack(fill="x", pady=(6, 0))
-        checks = [
-            ("opt_posts", "帖子"),
-            ("opt_profilepic", "头像"),
-            ("opt_reels", "Reels"),
-            ("opt_stories", "快拍Stories（要登录）"),
-            ("opt_highlights", "精选Highlights（要登录）"),
-            ("opt_classify", "按类型分文件夹（图片/视频）"),
-            ("opt_skip_existing", "跳过已下载"),
-            ("opt_only_video", "只下视频"),
-            ("opt_only_image", "只下图片"),
-        ]
-        for i, (key, label) in enumerate(checks):
-            cb = tk.Checkbutton(orow, text=label, variable=self.opt_vars[key],
-                                command=lambda k=key: self._on_option_changed(k))
-            cb.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 12))
+        if self.settings.get("cookie"):
+            self.cookie_text.insert("1.0", self.settings["cookie"])
+            self.login_status.config(text="登录状态：已保存 Cookie，点「保存并登录」验证")
+        self.username_entry.insert(0, self.settings.get("last_username", ""))
+        self.dir_entry.insert(0, self.settings.get("download_dir", str(app_dir() / "downloads")))
+        self.proxy_entry.insert(0, self.settings.get("proxy", ""))
 
-        srow = tk.Frame(dl_frame)
-        srow.pack(fill="x", pady=(6, 0))
-        tk.Label(srow, text="速度：").pack(side="left")
-        tk.Radiobutton(srow, text="正常", value="正常", variable=self.speed_var,
-                       command=self._save_settings_from_ui).pack(side="left")
-        tk.Radiobutton(srow, text="快速", value="快速", variable=self.speed_var,
-                       command=self._save_settings_from_ui).pack(side="left")
-        tk.Label(srow, text="（快速会去掉等待、明显更快，但更容易被限流）", fg="#666666").pack(side="left")
+        self.root.after(100, self.drain)
 
-        drow = tk.Frame(dl_frame)
-        drow.pack(fill="x", pady=(6, 0))
-        tk.Label(drow, text="下载位置：").pack(side="left")
-        tk.Entry(drow, textvariable=self.download_dir_var).pack(side="left", fill="x", expand=True)
-        tk.Button(drow, text="选择文件夹", command=self.on_choose_dir).pack(side="left", padx=(6, 0))
-        tk.Button(drow, text="打开下载文件夹", command=self.on_open_dir).pack(side="left", padx=(6, 0))
+    # ---------- helpers
+    def log(self, msg):
+        self.q.put(("log", str(msg)))
 
-        brow = tk.Frame(dl_frame)
-        brow.pack(fill="x", pady=(8, 0))
-        self.start_btn = tk.Button(brow, text="开始下载", width=16, height=1, command=self.on_start_download)
-        self.start_btn.pack(side="left")
-        self.stop_btn = tk.Button(brow, text="停止", width=10, command=self.on_stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=(8, 0))
-        tk.Label(brow, textvariable=self.progress_var).pack(side="left", padx=(12, 0))
-
-        # ---------------- 日志区 ----------------
-        log_frame = tk.LabelFrame(root, text="日志", padx=8, pady=6)
-        log_frame.pack(fill="both", expand=True, padx=10, pady=(4, 10))
-        self.log_text = scrolledtext.ScrolledText(log_frame, wrap="word", state="disabled")
-        self.log_text.pack(fill="both", expand=True)
-
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.after(100, self._poll_queue)
-
-        self.log("程序已打开。数据文件夹：" + str(DATA_DIR))
-        self.log("网络设置：" + (f"已按系统代理走（{SYSTEM_PROXY_NOTE}）"
-                                  if SYSTEM_PROXY_NOTE else "没读到系统代理（直连或隧道模式）")
-                 + "；已强制 IPv4")
-        self._startup_session_check()
-
-    # ---------------- 通用小工具 ----------------
-    def log(self, text):
-        self.msg_queue.put(("log", str(text)))
-
-    def _poll_queue(self):
+    def drain(self):
         try:
             while True:
-                kind, payload = self.msg_queue.get_nowait()
+                kind, payload = self.q.get_nowait()
                 if kind == "log":
-                    self._append_log(payload)
-                elif kind == "status":
-                    self.login_status_var.set(payload)
+                    self.log_text.insert("end", payload + "\n")
+                    self.log_text.see("end")
                 elif kind == "progress":
-                    self.progress_var.set(payload)
-                elif kind == "2fa":
-                    self._handle_2fa_request(payload)
-                elif kind == "download_done":
-                    self.downloading = False
-                    self.start_btn.config(state="normal")
-                    self.stop_btn.config(state="disabled")
+                    cur, total = payload
+                    if total:
+                        self.progress["value"] = cur * 100.0 / total
+                        self.progress_label.config(text=f"进度：{cur} / {total}")
+                elif kind == "login_ok":
+                    self.login_status.config(text=f"登录状态：已登录 @{payload}")
+                elif kind == "login_fail":
+                    self.login_status.config(text="登录状态：登录失败，看日志")
+                elif kind == "busy":
+                    self.busy = payload
+                    state = "disabled" if payload else "normal"
+                    self.btn_login.config(state=state)
+                    self.btn_start.config(state=state)
+                    self.btn_stop.config(state="normal" if payload else "disabled")
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_queue)
+        self.root.after(100, self.drain)
 
-    def _append_log(self, text):
-        stamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.config(state="normal")
-        self.log_text.insert("end", f"[{stamp}] {text}\n")
-        self.log_text.see("end")
-        self.log_text.config(state="disabled")
-
-    def _handle_2fa_request(self, req: TwoFactorRequest):
-        from tkinter import simpledialog
-
-        code = simpledialog.askstring(
-            "两步验证",
-            "Instagram 要两步验证码。\n请输入你手机上收到的验证码：",
-            parent=self.root)
-        req.code = (code or "").strip() or None
-        req.event.set()
-
-    def _paste_into(self, var):
+    def paste_cookie(self):
         try:
-            text = self.root.clipboard_get().strip()
+            text = self.root.clipboard_get()
         except Exception:
             text = ""
         if text:
-            var.set(text)
-
-    def _toggle_show_pass(self):
-        self.login_pass_entry.config(show="" if self.show_pass_var.get() else "*")
-
-    def _save_settings_from_ui(self):
-        data = {
-            "login_username": self.settings.get("login_username", ""),
-            "download_dir": self.download_dir_var.get().strip(),
-            "speed": self.speed_var.get(),
-        }
-        for key, var in self.opt_vars.items():
-            data[key] = bool(var.get())
-        self.settings.update(data)
-        try:
-            save_settings(self.settings)
-        except Exception as exc:
-            self.log(f"保存设置失败：{exc}")
-
-    def _on_option_changed(self, key):
-        # 只下视频 / 只下图片 不能同时开
-        if key == "opt_only_video" and self.opt_vars["opt_only_video"].get():
-            self.opt_vars["opt_only_image"].set(False)
-        if key == "opt_only_image" and self.opt_vars["opt_only_image"].get():
-            self.opt_vars["opt_only_video"].set(False)
-        self._save_settings_from_ui()
-
-    def on_close(self):
-        self._save_settings_from_ui()
-        self.root.destroy()
-
-    # ---------------- 登录 ----------------
-    def _startup_session_check(self):
-        username = (self.settings.get("login_username") or "").strip()
-        if username and session_path(username).is_file():
-            self.login_status_var.set(f"登录状态：已保存 {username} 的登录，正在确认…")
-            threading.Thread(target=self._verify_saved_session, args=(username,), daemon=True).start()
-        else:
-            self.login_status_var.set("登录状态：未登录")
-
-    def _verify_saved_session(self, username):
-        try:
-            loader = make_loader(self.speed_var.get())
-            if not load_saved_session(loader, username):
-                self.msg_queue.put(("status", "登录状态：未登录"))
-                return
-            who = loader.test_login()
-            if not who:
-                # test_login 偶尔误判，用保存的 ds_user_id 查本人资料兜底
-                try:
-                    uid = loader.context.user_id
-                    if uid:
-                        from instaloader.structures import Profile
-
-                        prof = Profile.from_id(loader.context, int(uid))
-                        if prof is not None and prof.username:
-                            who = prof.username
-                except Exception:
-                    who = None
-            if who:
-                self.logged_in_user = who
-                self.msg_queue.put(("status", f"登录状态：已登录 {who}"))
-                self.log(f"已自动恢复登录：{who}")
-            else:
-                self.msg_queue.put(("status", f"登录状态：{username} 的登录已失效，请重新登录"))
-                self.log("保存的登录已经失效了，请重新登录一次。")
-        except Exception as exc:
-            self.msg_queue.put(("status", f"登录状态：已保存 {username} 的登录（暂时连不上，没确认成）"))
-            self.log("确认登录状态时出错（不影响你手动下载/登录）：" + explain_error(exc))
-
-    def on_password_login(self):
-        username = self.login_user_var.get().strip().lstrip("@")
-        password = self.login_pass_var.get()
-        if not username or not password:
-            self.log("请先填用户名和密码（可以用旁边的“粘贴”按钮）。")
-            return
-        self.login_status_var.set("登录状态：正在登录…")
-        threading.Thread(target=self._password_login_worker, args=(username, password), daemon=True).start()
-
-    def _password_login_worker(self, username, password):
-        import instaloader
-
-        loader = make_loader(self.speed_var.get())
-        try:
-            try:
-                loader.login(username, password)
-            except instaloader.TwoFactorAuthRequiredException:
-                self.log("这个账号开了两步验证，正在等你输入验证码…")
-                req = TwoFactorRequest()
-                self.msg_queue.put(("2fa", req))
-                if not req.event.wait(timeout=180):
-                    self.log("等验证码超时，登录取消。")
-                    self.msg_queue.put(("status", "登录状态：未登录"))
-                    return
-                if not req.code:
-                    self.log("没有输入验证码，登录取消。")
-                    self.msg_queue.put(("status", "登录状态：未登录"))
-                    return
-                loader.two_factor_login(req.code)
-            SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-            loader.save_session_to_file(filename=str(session_path(username)))
-            self.logged_in_user = username
-            self.settings["login_username"] = username
-            save_settings(self.settings)
-            self.msg_queue.put(("status", f"登录状态：已登录 {username}"))
-            self.log(f"登录成功，登录状态已保存，下次打开不用再登：{username}")
-        except Exception as exc:
-            self.msg_queue.put(("status", "登录状态：未登录"))
-            self.log("登录失败：" + explain_error(exc))
-
-
-    def on_paste_cookie(self):
-        try:
-            text = self.root.clipboard_get()
-        except Exception:
-            text = ""
-        if text.strip():
             self.cookie_text.delete("1.0", "end")
             self.cookie_text.insert("1.0", text.strip())
+            self.log("已从剪贴板粘贴 Cookie")
+        else:
+            self.log("剪贴板是空的")
 
-    def on_cookie_login(self):
-        raw = self.cookie_text.get("1.0", "end").strip()
-        cookies = parse_cookie_string(raw)
-        if not cookies:
-            self.log("Cookie 是空的。先在浏览器里登录 Instagram，复制整串 Cookie，再点“粘贴”。")
-            return
-        if not cookies.get("sessionid"):
-            self.log("这串 Cookie 里没有 sessionid，这一项是登录的关键，缺了登不上。"
-                     "请确认复制的是 instagram.com 的完整 Cookie（整行都要）。")
-            return
-        if not cookies.get("csrftoken"):
-            self.log("提醒：这串 Cookie 里没有 csrftoken，可能下载时会报错，先试着登录校验。")
-        self.login_status_var.set("登录状态：正在用Cookie校验…")
-        threading.Thread(target=self._cookie_login_worker, args=(cookies,), daemon=True).start()
-
-    def _cookie_login_worker(self, cookies):
-        found = "、".join(
-            f"{name} {'有' if cookies.get(name) else '没有'}"
-            for name in ("sessionid", "csrftoken", "ds_user_id"))
-        self.log(f"解析到 {len(cookies)} 项 Cookie，其中 {found}。（只报有无，不显示内容）")
-        if not sessionid_looks_complete(cookies):
-            self.log("提醒：sessionid 看起来不完整——正常的是一长串、中间有好几段。"
-                     "如果这次验不过，多半是复制时只复制到一截，请回到浏览器把整行 Cookie 完整复制。")
-        _net_self_check(self.log)
-        loader = make_loader(self.speed_var.get())
-        try:
-            status, who = verify_login_timed(loader, cookies, self.log, timeout=90)
-            if status == "timeout":
-                self.msg_queue.put(("status", "登录状态：未登录"))
-                self.log("向 Instagram 确认时 90 秒没等到回应（多半是被限流或网络卡住），"
-                         "不是当场判死刑。过几分钟再点一次就行。")
-                return
-            if not who:
-                self.msg_queue.put(("status", "登录状态：未登录"))
-                self.log("这个 Cookie 没通过：Instagram 没认这个登录。"
-                         "先确认浏览器里打开 instagram.com 还是登录着的状态；"
-                         "复制时要选发往 www.instagram.com 的那条请求、整行 Cookie 都要，不要只截一截。")
-                return
-            SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-            loader.save_session_to_file(filename=str(session_path(who)))
-            self.logged_in_user = who
-            self.settings["login_username"] = who
-            save_settings(self.settings)
-            self.msg_queue.put(("status", f"登录状态：已登录 {who}"))
-            self.log(f"Cookie 登录成功，登录状态已保存，下次打开不用再粘：{who}")
-        except Exception as exc:
-            self.msg_queue.put(("status", "登录状态：未登录"))
-            self.log("Cookie 登录失败：" + explain_error(exc))
-
-    def on_logout(self):
-        username = (self.settings.get("login_username") or self.login_user_var.get()).strip()
-        removed = False
-        if username:
-            path = session_path(username)
-            if path.is_file():
-                try:
-                    path.unlink()
-                    removed = True
-                except Exception as exc:
-                    self.log(f"删除登录保存失败：{exc}")
-        self.settings["login_username"] = ""
-        self.logged_in_user = ""
-        save_settings(self.settings)
-        self.login_status_var.set("登录状态：未登录")
-        self.log("已退出登录" + ("，保存的登录已删除。" if removed else "。"))
-
-    # ---------------- 下载 ----------------
-    def on_paste_targets(self):
+    def paste_username(self):
         try:
             text = self.root.clipboard_get()
         except Exception:
             text = ""
-        if text.strip():
-            current = self.targets_text.get("1.0", "end").strip()
-            self.targets_text.delete("1.0", "end")
-            self.targets_text.insert("1.0", (current + "\n" + text.strip()).strip() + "\n")
+        if text:
+            self.username_entry.delete(0, "end")
+            self.username_entry.insert(0, text.strip())
 
-    def on_clear_targets(self):
-        self.targets_text.delete("1.0", "end")
+    def choose_dir(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.dir_entry.delete(0, "end")
+            self.dir_entry.insert(0, d)
 
-    def on_choose_dir(self):
-        from tkinter import filedialog
+    def current_proxy(self) -> str:
+        manual = self.proxy_entry.get().strip()
+        if manual:
+            return manual
+        return detect_proxy()
 
-        chosen = filedialog.askdirectory(initialdir=self.download_dir_var.get() or str(DEFAULT_DOWNLOAD_DIR))
-        if chosen:
-            self.download_dir_var.set(chosen)
-            self._save_settings_from_ui()
+    def persist(self):
+        self.settings.update({
+            "cookie": self.cookie_text.get("1.0", "end").strip(),
+            "last_username": self.username_entry.get().strip().lstrip("@"),
+            "download_dir": self.dir_entry.get().strip(),
+            "proxy": self.proxy_entry.get().strip(),
+        })
+        save_settings(self.settings)
 
-    def on_open_dir(self):
-        path = Path(self.download_dir_var.get().strip() or str(DEFAULT_DOWNLOAD_DIR))
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            os.startfile(str(path))  # Windows 打开文件夹
-        except Exception as exc:
-            self.log(f"打开下载文件夹失败：{exc}（路径：{path}）")
+    # ---------- actions
+    def on_login(self):
+        if self.busy:
+            return
+        cookie = self.cookie_text.get("1.0", "end").strip()
+        if not cookie:
+            self.log("先粘贴 Cookie 再登录")
+            return
+        self.persist()
+        proxy = self.current_proxy()
+        self.q.put(("busy", True))
+
+        def work():
+            try:
+                if proxy:
+                    self.log(f"使用代理：{proxy}")
+                cl = make_client(extract_sessionid(cookie), proxy)
+                self.log(f"登录成功：@{cl.username}")
+                self.q.put(("login_ok", cl.username))
+            except Exception as e:
+                self.log(f"登录失败：{type(e).__name__}：{str(e)[:300]}")
+                self.q.put(("login_fail", ""))
+            finally:
+                self.q.put(("busy", False))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_start(self):
+        if self.busy:
+            return
+        cookie = self.cookie_text.get("1.0", "end").strip()
+        username = self.username_entry.get().strip().lstrip("@")
+        base_dir = self.dir_entry.get().strip()
+        if not cookie:
+            self.log("先粘贴 Cookie 并登录")
+            return
+        if not username:
+            self.log("先输入要下载的用户名")
+            return
+        if not base_dir:
+            self.log("先选下载文件夹")
+            return
+        self.persist()
+        proxy = self.current_proxy()
+        self.stop_event.clear()
+        self.q.put(("busy", True))
+        self.progress["value"] = 0
+
+        def work():
+            try:
+                if proxy:
+                    self.log(f"使用代理：{proxy}")
+                cl = make_client(extract_sessionid(cookie), proxy)
+                self.log(f"已登录：@{cl.username}，开始下载 @{username} 的全部内容")
+                run_batch(
+                    cl, username, Path(base_dir), self.log,
+                    should_stop=self.stop_event.is_set,
+                    progress=lambda i, n: self.q.put(("progress", (i, n))),
+                )
+            except Exception as e:
+                self.log(f"出错：{type(e).__name__}：{str(e)[:300]}")
+            finally:
+                self.q.put(("busy", False))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def on_stop(self):
-        self.stop_flag.set()
-        self.log("正在停止：当前这一个下完就会停…")
-
-    def on_start_download(self):
-        if self.downloading:
-            return
-        targets = parse_targets(self.targets_text.get("1.0", "end"))
-        if not targets:
-            self.log("先填要下载的账号：一行一个用户名，或者粘贴主页链接。帖子链接认不出用户名。")
-            return
-        self._save_settings_from_ui()
-        self.stop_flag.clear()
-        self.downloading = True
-        self.start_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
-        opts = {key: bool(var.get()) for key, var in self.opt_vars.items()}
-        args = (
-            targets,
-            self.download_dir_var.get().strip() or str(DEFAULT_DOWNLOAD_DIR),
-            self.speed_var.get(),
-            opts,
-            (self.settings.get("login_username") or "").strip(),
-        )
-        threading.Thread(target=self._download_worker, args=args, daemon=True).start()
-
-    def _download_worker(self, targets, download_dir, speed, opts, login_username):
-        import instaloader
-        from instaloader import Profile
-
-        counts = {"downloaded": 0, "skipped": 0, "failed": 0}
-
-        def report_progress():
-            self.msg_queue.put((
-                "progress",
-                f"进度：已下载 {counts['downloaded']} · 已跳过 {counts['skipped']} · 失败 {counts['failed']}",
-            ))
-
-        def note_result(ok):
-            if ok:
-                counts["downloaded"] += 1
-            else:
-                counts["skipped"] += 1
-            report_progress()
-
-        loader = make_loader(
-            speed=speed,
-            only_video=opts["opt_only_video"],
-            only_image=opts["opt_only_image"],
-            download_dir=download_dir,
-        )
-        if login_username and load_saved_session(loader, login_username):
-            self.log(f"本次下载使用已登录的账号：{login_username}")
-        else:
-            self.log("本次下载没有登录（只能下公开账号，快拍/精选下不了，也更容易被限流）。")
-        if not opts["opt_skip_existing"]:
-            self.log("提醒：你关了“跳过已下载”，但原版引擎看到文件已经存在时还是会自动跳过，这版暂时不能强制重下。")
-
-        self.log(f"开始下载，共 {len(targets)} 个账号，保存到：{download_dir}")
-
-        for username in targets:
-            if self.stop_flag.is_set():
-                self.log("已停止。")
-                break
-            self.log(f"===== 开始：@{username} =====")
-            try:
-                profile = Profile.from_username(loader.context, username)
-            except Exception as exc:
-                counts["failed"] += 1
-                report_progress()
-                self.log(f"@{username} 打不开：" + explain_error(exc))
-                continue
-
-            user = profile.username
-            if profile.is_private and not profile.followed_by_viewer:
-                self.log(f"提醒：@{user} 是私密账号，你登录的账号没关注他/没通过，可能下不到内容。")
-
-            # 头像
-            if opts["opt_profilepic"]:
-                try:
-                    loader.download_profilepic(profile)
-                    self.log(f"@{user} 头像已下载（已存在会自动跳过）")
-                except Exception as exc:
-                    self.log(f"@{user} 头像下载失败：" + explain_error(exc))
-
-            # 帖子
-            if opts["opt_posts"]:
-                try:
-                    index = 0
-                    for post in profile.get_posts():
-                        if self.stop_flag.is_set():
-                            break
-                        index += 1
-                        if opts["opt_only_video"] and not post.is_video:
-                            continue
-                        if opts["opt_only_image"] and post.is_video:
-                            continue
-                        if opts["opt_classify"]:
-                            if post.typename == "GraphSidecar":
-                                target = f"{user}/图文"
-                            elif post.is_video:
-                                target = f"{user}/视频"
-                            else:
-                                target = f"{user}/图片"
-                        else:
-                            target = user
-                        self.log(f"正在下载 @{user} 的帖子 第{index}个…")
-                        try:
-                            note_result(loader.download_post(post, target))
-                        except Exception as exc:
-                            counts["failed"] += 1
-                            report_progress()
-                            self.log(f"@{user} 帖子第{index}个失败：" + explain_error(exc))
-                    self.log(f"@{user} 帖子处理完（共看到 {index} 个）")
-                except Exception as exc:
-                    counts["failed"] += 1
-                    report_progress()
-                    self.log(f"@{user} 帖子列表拉取失败：" + explain_error(exc))
-
-            # Reels（4.16 的方法是 get_reels）
-            if opts["opt_reels"] and hasattr(profile, "get_reels"):
-                try:
-                    index = 0
-                    for post in profile.get_reels():
-                        if self.stop_flag.is_set():
-                            break
-                        index += 1
-                        if opts["opt_only_image"]:
-                            continue
-                        target = f"{user}/视频" if opts["opt_classify"] else f"{user}/Reels"
-                        self.log(f"正在下载 @{user} 的Reels 第{index}个…")
-                        try:
-                            note_result(loader.download_post(post, target))
-                        except Exception as exc:
-                            counts["failed"] += 1
-                            report_progress()
-                            self.log(f"@{user} Reels第{index}个失败：" + explain_error(exc))
-                    if index:
-                        self.log(f"@{user} Reels处理完（共看到 {index} 个）")
-                except Exception as exc:
-                    counts["failed"] += 1
-                    report_progress()
-                    self.log(f"@{user} Reels列表拉取失败：" + explain_error(exc))
-
-            # 快拍 Stories
-            if opts["opt_stories"]:
-                try:
-                    for story in loader.get_stories(userids=[profile.userid]):
-                        for item in story.get_items():
-                            if self.stop_flag.is_set():
-                                break
-                            if opts["opt_only_video"] and not item.is_video:
-                                continue
-                            if opts["opt_only_image"] and item.is_video:
-                                continue
-                            self.log(f"正在下载 @{user} 的快拍…")
-                            try:
-                                note_result(loader.download_storyitem(item, f"{user}/快拍"))
-                            except Exception as exc:
-                                counts["failed"] += 1
-                                report_progress()
-                                self.log(f"@{user} 快拍失败：" + explain_error(exc))
-                except Exception as exc:
-                    counts["failed"] += 1
-                    report_progress()
-                    self.log(f"@{user} 快拍拉取失败：" + explain_error(exc))
-
-            # 精选 Highlights（4.16 没有 download_highlight，逐条下精选里的条目）
-            if opts["opt_highlights"]:
-                try:
-                    for highlight in loader.get_highlights(profile):
-                        if self.stop_flag.is_set():
-                            break
-                        self.log(f"正在下载 @{user} 的精选：{highlight.title}")
-                        for item in highlight.get_items():
-                            if self.stop_flag.is_set():
-                                break
-                            if opts["opt_only_video"] and not item.is_video:
-                                continue
-                            if opts["opt_only_image"] and item.is_video:
-                                continue
-                            try:
-                                note_result(loader.download_storyitem(item, f"{user}/精选"))
-                            except Exception as exc:
-                                counts["failed"] += 1
-                                report_progress()
-                                self.log(f"@{user} 精选失败：" + explain_error(exc))
-                except Exception as exc:
-                    counts["failed"] += 1
-                    report_progress()
-                    self.log(f"@{user} 精选拉取失败：" + explain_error(exc))
-
-            self.log(f"===== 完成：@{user} =====")
-
-        self.log(
-            f"全部结束：已下载 {counts['downloaded']} · 已跳过 {counts['skipped']} · 失败 {counts['failed']}"
-            f"。文件在：{download_dir}")
-        self.msg_queue.put(("download_done", None))
+        self.stop_event.set()
+        self.log("正在停止…（当前文件下完就停）")
 
 
 def main():
-    import tkinter as tk
-
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     root = tk.Tk()
     App(root)
     root.mainloop()
